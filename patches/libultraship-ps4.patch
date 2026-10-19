@@ -1,0 +1,3916 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 08cc7915..2c7fae74 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -68,6 +68,10 @@ if(CMAKE_SYSTEM_NAME STREQUAL "OpenBSD")
+     include(cmake/dependencies/openbsd.cmake)
+ endif()
+ 
++if(PS4)
++    include(cmake/dependencies/ps4.cmake)
++endif()
++
+ if (CMAKE_SYSTEM_NAME STREQUAL "Windows")
+     include(cmake/dependencies/windows.cmake)
+ endif()
+diff --git a/cmake/dependencies/common.cmake b/cmake/dependencies/common.cmake
+index 46d55e48..2ec3dc0f 100644
+--- a/cmake/dependencies/common.cmake
++++ b/cmake/dependencies/common.cmake
+@@ -27,11 +27,21 @@ target_sources(ImGui
+     ${imgui_SOURCE_DIR}/imgui.cpp
+ )
+ 
++if(PS4)
++    # PS4: no OpenGL and no SDL window. ImGui draws through Vulkan (RADV, functions loaded at
++    # runtime) and the PS4 window backend feeds its input directly.
++    target_sources(ImGui
++        PRIVATE
++        ${imgui_SOURCE_DIR}/backends/imgui_impl_vulkan.cpp
++    )
++    target_compile_definitions(ImGui PUBLIC IMGUI_IMPL_VULKAN_NO_PROTOTYPES)
++else()
+ target_sources(ImGui
+     PRIVATE
+     ${imgui_SOURCE_DIR}/backends/imgui_impl_opengl3.cpp
+     ${imgui_SOURCE_DIR}/backends/imgui_impl_sdl2.cpp
+ )
++endif()
+ 
+ target_include_directories(ImGui PUBLIC ${imgui_SOURCE_DIR} ${imgui_SOURCE_DIR}/backends PRIVATE ${SDL2_INCLUDE_DIRS})
+ 
+@@ -131,6 +141,13 @@ FetchContent_Declare(
+     GIT_TAG 1de054450e7b3c5f777d2e3dfcb228ad120c329d
+ )
+ FetchContent_MakeAvailable(prism)
++if(PS4 AND TARGET prism)
++    # prism's CMakeLists sets CMAKE_CXX_FLAGS outright, dropping the toolchain's target, sysroot and
++    # libc++ flags; without them it compiles against the host's libstdc++ and glibc.
++    # SHELL: keeps the flags as one group; CMake would otherwise de-duplicate the repeated
++    # "-isystem" words and break their pairs.
++    target_compile_options(prism PRIVATE "$<$<COMPILE_LANGUAGE:CXX>:SHELL:${CMAKE_CXX_FLAGS_INIT}>")
++endif()
+ 
+ # prism's CMakeLists.txt calls cmake_minimum_required(VERSION <3.10), which causes
+ # CMake to explicitly set CMP0141=OLD in prism's scope (cmake_policy(VERSION) disables
+diff --git a/cmake/dependencies/ps4.cmake b/cmake/dependencies/ps4.cmake
+new file mode 100644
+index 00000000..af361e43
+--- /dev/null
++++ b/cmake/dependencies/ps4.cmake
+@@ -0,0 +1,105 @@
++# PS4 homebrew (PacBrew OpenOrbis toolchain + DolphinPS4's clang 21 / libc++ 21, see
++# G-Diffuser-PS4/toolchain). C libraries come from PacBrew; C++ libraries are built from source so
++# they use the same libc++ as everything else.
++include(FetchContent)
++
++set(OPENORBIS_USR "${OPENORBIS}/usr")
++
++#=================== SDL2 (PacBrew: joystick + audio drivers; no SDL video) ===================
++add_library(SDL2::SDL2 STATIC IMPORTED GLOBAL)
++set_target_properties(SDL2::SDL2 PROPERTIES
++    IMPORTED_LOCATION "${OPENORBIS_USR}/lib/libSDL2.a"
++    INTERFACE_INCLUDE_DIRECTORIES "${OPENORBIS_USR}/include/SDL2"
++    INTERFACE_COMPILE_DEFINITIONS "_REENTRANT")
++# From PacBrew's sdl2.pc. SDL's PS4 video driver needs Piglet; it is linked but never started.
++target_link_libraries(SDL2::SDL2 INTERFACE
++    "${OPENORBIS_USR}/lib/libsamplerate.a" -lSceSystemService -lSceSysUtil -lSceSysmodule
++    -lSceUserService -lSceAudioOut -lScePad -lScePigletv2VSH)
++set(SDL2_FOUND TRUE)
++set(SDL2_INCLUDE_DIRS "${OPENORBIS_USR}/include/SDL2")
++set(SDL2_LIBRARIES SDL2::SDL2)
++target_link_libraries(ImGui PUBLIC SDL2::SDL2)
++
++#=================== zlib / bzip2 (PacBrew) ===================
++add_library(ZLIB::ZLIB STATIC IMPORTED GLOBAL)
++set_target_properties(ZLIB::ZLIB PROPERTIES
++    IMPORTED_LOCATION "${OPENORBIS_USR}/lib/libz.a"
++    INTERFACE_INCLUDE_DIRECTORIES "${OPENORBIS_USR}/include")
++set(ZLIB_FOUND TRUE)
++set(ZLIB_LIBRARY "${OPENORBIS_USR}/lib/libz.a" CACHE FILEPATH "" FORCE)
++set(ZLIB_INCLUDE_DIR "${OPENORBIS_USR}/include" CACHE PATH "" FORCE)
++set(BZIP2_LIBRARY_RELEASE "${OPENORBIS_USR}/lib/libbz2.a" CACHE FILEPATH "" FORCE)
++set(BZIP2_LIBRARIES "${OPENORBIS_USR}/lib/libbz2.a" CACHE FILEPATH "" FORCE)
++set(BZIP2_INCLUDE_DIR "${OPENORBIS_USR}/include" CACHE PATH "" FORCE)
++
++#=================== nlohmann-json ===================
++FetchContent_Declare(
++    nlohmann_json
++    GIT_REPOSITORY https://github.com/nlohmann/json.git
++    GIT_TAG v3.12.0
++    OVERRIDE_FIND_PACKAGE
++)
++FetchContent_MakeAvailable(nlohmann_json)
++
++#=================== tinyxml2 ===================
++set(tinyxml2_BUILD_TESTING OFF)
++FetchContent_Declare(
++    tinyxml2
++    GIT_REPOSITORY https://github.com/leethomason/tinyxml2.git
++    GIT_TAG 11.0.0
++    OVERRIDE_FIND_PACKAGE
++)
++FetchContent_MakeAvailable(tinyxml2)
++
++#=================== spdlog ===================
++FetchContent_Declare(
++    spdlog
++    GIT_REPOSITORY https://github.com/gabime/spdlog.git
++    GIT_TAG v1.16.0
++    OVERRIDE_FIND_PACKAGE
++)
++FetchContent_MakeAvailable(spdlog)
++
++#=================== libzip ===================
++set(CMAKE_POLICY_DEFAULT_CMP0077 NEW)
++set(BUILD_TOOLS OFF)
++set(BUILD_REGRESS OFF)
++set(BUILD_EXAMPLES OFF)
++set(BUILD_DOC OFF)
++set(BUILD_OSSFUZZ OFF)
++set(BUILD_SHARED_LIBS OFF)
++set(ENABLE_COMMONCRYPTO OFF)
++set(ENABLE_GNUTLS OFF)
++set(ENABLE_MBEDTLS OFF)
++set(ENABLE_OPENSSL OFF)
++set(ENABLE_WINDOWS_CRYPTO OFF)
++set(ENABLE_LZMA OFF)
++set(ENABLE_ZSTD OFF)
++set(ENABLE_BZIP2 ON)
++FetchContent_Declare(
++    libzip
++    GIT_REPOSITORY https://github.com/nih-at/libzip.git
++    GIT_TAG v1.11.4
++    OVERRIDE_FIND_PACKAGE
++)
++FetchContent_MakeAvailable(libzip)
++list(APPEND ADDITIONAL_LIB_INCLUDES ${libzip_SOURCE_DIR}/lib ${libzip_BINARY_DIR})
++
++#=================== Vulkan (Mesa RADV on GNM, from DolphinPS4) ===================
++# Headers only here: the driver itself is linked into the executable (ps4_link_mesa).
++set(PS4_MESA_SRC "$ENV{PS4_MESA_SRC}" CACHE PATH "Mesa source tree (Vulkan headers)")
++if (NOT EXISTS "${PS4_MESA_SRC}/include/vulkan/vulkan_core.h")
++    message(FATAL_ERROR "PS4_MESA_SRC (${PS4_MESA_SRC}) has no include/vulkan; see scripts/ps4-env.sh")
++endif ()
++list(APPEND ADDITIONAL_LIB_INCLUDES "${PS4_MESA_SRC}/include")
++target_include_directories(ImGui PUBLIC "${PS4_MESA_SRC}/include")
++
++#=================== Vulkan Memory Allocator (header only, as in Dolphin) ===================
++FetchContent_Declare(
++    VulkanMemoryAllocator
++    GIT_REPOSITORY https://github.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator.git
++    GIT_TAG v3.1.0
++    SOURCE_SUBDIR do-not-add-subdirectory
++)
++FetchContent_MakeAvailable(VulkanMemoryAllocator)
++list(APPEND ADDITIONAL_LIB_INCLUDES "${vulkanmemoryallocator_SOURCE_DIR}/include")
+diff --git a/include/fast/Fast3dGui.h b/include/fast/Fast3dGui.h
+index 24f75703..df9e4589 100644
+--- a/include/fast/Fast3dGui.h
++++ b/include/fast/Fast3dGui.h
+@@ -41,6 +41,10 @@ typedef struct {
+             uint32_t Width;  ///< Framebuffer width in pixels.
+             uint32_t Height; ///< Framebuffer height in pixels.
+         } Gx2;
++        struct {
++            uint32_t Width;  ///< VideoOut buffer width in pixels.
++            uint32_t Height; ///< VideoOut buffer height in pixels.
++        } Ps4;
+     };
+ } GuiWindowInitData;
+ 
+diff --git a/include/fast/Fast3dWindow.h b/include/fast/Fast3dWindow.h
+index 3acdda5a..1a05ccd8 100644
+--- a/include/fast/Fast3dWindow.h
++++ b/include/fast/Fast3dWindow.h
+@@ -23,6 +23,7 @@ enum WindowBackend {
+     FAST3D_DXGI_DX11 = 1,
+     FAST3D_SDL_OPENGL = 2,
+     FAST3D_SDL_METAL = 3,
++    FAST3D_PS4_VULKAN = 4,
+ };
+ 
+ class Fast3dWindow : public Ship::Window {
+diff --git a/include/fast/backends/gfx_ps4.h b/include/fast/backends/gfx_ps4.h
+new file mode 100644
+index 00000000..9ec46d1e
+--- /dev/null
++++ b/include/fast/backends/gfx_ps4.h
+@@ -0,0 +1,54 @@
++#ifdef ENABLE_VULKAN
++#pragma once
++
++// PS4 "window": the TV. The output is the VideoOut buffers owned by GfxRenderingAPIVulkan, so
++// this backend only reports their size, keeps time, and pumps SDL for its joystick (DualShock 4)
++// and audio drivers. There is no keyboard or mouse.
++
++#include "gfx_window_manager_api.h"
++
++namespace Fast {
++
++class GfxWindowBackendPS4 final : public GfxWindowBackend {
++  public:
++    GfxWindowBackendPS4() = default;
++    ~GfxWindowBackendPS4() override = default;
++
++    void Init(const char* gameName, const char* apiName, bool startFullScreen, uint32_t width, uint32_t height,
++              int32_t posX, int32_t posY) override;
++    void Close() override;
++    void SetKeyboardCallbacks(bool (*onKeyDown)(int scancode), bool (*onKeyUp)(int scancode),
++                              void (*onAllKeysUp)()) override;
++    void SetMouseCallbacks(bool (*onMouseButtonDown)(int btn), bool (*onMouseButtonUp)(int btn)) override;
++    void SetFullscreenChangedCallback(void (*onFullscreenChanged)(bool is_now_fullscreen)) override;
++    void SetFullscreen(bool fullscreen) override;
++    void GetActiveWindowRefreshRate(uint32_t* refreshRate) override;
++    void SetCursorVisibility(bool visibility) override;
++    void SetMousePos(int32_t posX, int32_t posY) override;
++    void GetMousePos(int32_t* x, int32_t* y) override;
++    void GetMouseDelta(int32_t* x, int32_t* y) override;
++    void GetMouseWheel(float* x, float* y) override;
++    bool GetMouseState(uint32_t btn) override;
++    void SetMouseCapture(bool capture) override;
++    bool IsMouseCaptured() override;
++    void SetMouseGrab(bool grab) override;
++    void GetDimensions(uint32_t* width, uint32_t* height, int32_t* posX, int32_t* posY) override;
++    void SetDimensions(uint32_t width, uint32_t height, int32_t posX, int32_t posY) override;
++    Ship::WindowRect GetPrimaryMonitorRect() override;
++    void HandleEvents() override;
++    bool IsFrameReady() override;
++    void SwapBuffersBegin() override;
++    void SwapBuffersEnd() override;
++    double GetTime() override;
++    int GetTargetFps() override;
++    void SetTargetFps(int fps) override;
++    void SetMaxFrameLatency(int latency) override;
++    const char* GetKeyName(int scancode) override;
++    bool CanDisableVsync() override;
++    bool IsRunning() override;
++    void Destroy() override;
++    bool IsFullscreen() override;
++};
++
++} // namespace Fast
++#endif
+diff --git a/include/fast/backends/gfx_vulkan.h b/include/fast/backends/gfx_vulkan.h
+new file mode 100644
+index 00000000..73ba9c34
+--- /dev/null
++++ b/include/fast/backends/gfx_vulkan.h
+@@ -0,0 +1,99 @@
++#ifdef ENABLE_VULKAN
++#pragma once
++
++// Fast3D on Vulkan, for the PS4: Mesa's RADV running on GNM (DolphinPS4's port/mesa), linked into
++// the executable. RADV has no window system on the console, so the "swap chain" is three linear
++// images registered as VideoOut buffers, flipped once the GPU has finished a frame - the scheme
++// DolphinPS4's VKSwapChain.cpp uses.
++//
++// Conventions follow the Direct3D 11 backend (GetClipParameters {true, false}): render targets are
++// stored top-down, depth runs 0..1, and the viewport is flipped (negative height) so the
++// interpreter's OpenGL-style clip space comes out the right way up.
++
++#include "gfx_rendering_api.h"
++#include "../interpreter.h"
++
++#include <cstdint>
++#include <map>
++#include <memory>
++#include <unordered_map>
++#include <vector>
++
++struct ImDrawData;
++
++namespace Fast {
++
++struct VulkanState; // gfx_vulkan.cpp: device, frames, textures, framebuffers, pipelines
++
++class GfxRenderingAPIVulkan final : public GfxRenderingAPI {
++  public:
++    GfxRenderingAPIVulkan();
++    ~GfxRenderingAPIVulkan() override;
++    const char* GetName() override;
++    int GetMaxTextureSize() override;
++    GfxClipParameters GetClipParameters() override;
++    void UnloadShader(ShaderProgram* oldPrg) override;
++    void LoadShader(ShaderProgram* newPrg) override;
++    void ClearShaderCache() override;
++    ShaderProgram* CreateAndLoadNewShader(uint64_t shaderId0, uint64_t shaderId1) override;
++    ShaderProgram* LookupShader(uint64_t shaderId0, uint64_t shaderId1) override;
++    void ShaderGetInfo(ShaderProgram* prg, uint8_t* numInputs, bool usedTextures[2]) override;
++    uint32_t NewTexture() override;
++    void SelectTexture(int tile, uint32_t textureId) override;
++    void UploadTexture(const uint8_t* rgba32Buf, uint32_t width, uint32_t height) override;
++    void SetSamplerParameters(int sampler, bool linear_filter, uint32_t cms, uint32_t cmt) override;
++    void SetDepthTestAndMask(bool depth_test, bool z_upd) override;
++    void SetZmodeDecal(bool decal) override;
++    void SetViewport(int x, int y, int width, int height) override;
++    void SetScissor(int x, int y, int width, int height) override;
++    void SetUseAlpha(bool useAlpha) override;
++    void DrawTriangles(float buf_vbo[], size_t buf_vbo_len, size_t buf_vbo_num_tris) override;
++    void Init() override;
++    void OnResize() override;
++    void StartFrame() override;
++    void EndFrame() override;
++    void FinishRender() override;
++    int CreateFramebuffer() override;
++    void UpdateFramebufferParameters(int fb_id, uint32_t width, uint32_t height, uint32_t msaa_level,
++                                     bool opengl_invertY, bool render_target, bool has_depth_buffer,
++                                     bool can_extract_depth,
++                                     GdxFramebufferFormat format = GdxFramebufferFormat::R8G8B8A8_UNORM) override;
++    void StartDrawToFramebuffer(int fbId, float noiseScale) override;
++    void CopyFramebuffer(int fbDstId, int fbSrcId, int srcX0, int srcY0, int srcX1, int srcY1, int dstX0, int dstY0,
++                         int dstX1, int dstY1) override;
++    void ClearFramebuffer(bool color, bool depth) override;
++    void ClearDepthRegion(int x, int y, int w, int h) override;
++    void ReadFramebufferToCPU(int fbId, uint32_t width, uint32_t height, uint16_t* rgba16Buf) override;
++    void ResolveMSAAColorBuffer(int fbIdTarget, int fbIdSrc) override;
++    std::unordered_map<std::pair<float, float>, uint16_t, hash_pair_ff>
++    GetPixelDepth(int fb_id, const std::set<std::pair<float, float>>& coordinates) override;
++    void* GetFramebufferTextureId(int fbId) override;
++    void SelectTextureFb(int fbId) override;
++    void DeleteTexture(uint32_t texId) override;
++    void SetTextureFilter(FilteringMode mode) override;
++    FilteringMode GetTextureFilter() override;
++    void SetSrgbMode() override;
++    ImTextureID GetTextureById(int id) override;
++    void SetCurrentPrimDepth(float depth) override;
++    void SetCurrentAlphaCompareThreshold(float threshold) override;
++
++    // GUI (Fast3dGui, WindowBackend::FAST3D_PS4_VULKAN): ImGui draws into framebuffer 0 through
++    // the same device and command buffer as the game.
++    void ImGuiInit();
++    void ImGuiShutdown();
++    void ImGuiNewFrame();
++    void ImGuiRender(ImDrawData* data);
++
++    // The last presented frame, copied into a texture ImGui can draw: the PS4 quick menu's paused
++    // game (port/ps4/quick_menu.cpp). Null before the first present.
++    ImTextureID CaptureLastFrame();
++
++    // Output size (VideoOut buffers).
++    static void GetOutputSize(uint32_t* width, uint32_t* height);
++
++  private:
++    std::unique_ptr<VulkanState> mState;
++};
++
++} // namespace Fast
++#endif
+diff --git a/include/fast/backends/gfx_vulkan_shader.h b/include/fast/backends/gfx_vulkan_shader.h
+new file mode 100644
+index 00000000..55168f5f
+--- /dev/null
++++ b/include/fast/backends/gfx_vulkan_shader.h
+@@ -0,0 +1,28 @@
++#pragma once
++
++// Fast3D shader text for the Vulkan backend: the OpenGL backend's template expanded with GLSL 4.50
++// settings, then rewritten for Vulkan (gfx_vulkan_shader.cpp). Kept free of Vulkan and platform
++// headers so tests/vk_shader_test.cpp in G-Diffuser-PS4 can run it on the host.
++
++#include <cstddef>
++#include <optional>
++#include <string>
++
++struct CCFeatures;
++
++namespace Fast {
++
++// Sampler binding = Fast3D texture unit: uTex0, uTex1, uTexMask0, uTexMask1, uTexBlend0, uTexBlend1.
++// The fragment shader's loose uniforms become this push constant block (40 bytes).
++struct GdxVulkanShaderText {
++    std::string vs;
++    std::string fs;
++    size_t numFloats = 0; // vertex stride in floats
++};
++
++typedef std::optional<std::string> (*GdxShaderIncludeFunc)(const std::string&);
++
++GdxVulkanShaderText GdxBuildVulkanShaders(const CCFeatures& cc, const std::string& templateText,
++                                          bool threePointFiltering, bool srgb, GdxShaderIncludeFunc include);
++
++} // namespace Fast
+diff --git a/include/ship/audio/AudioPlayer.h b/include/ship/audio/AudioPlayer.h
+index b24adb62..0a6a7c2f 100644
+--- a/include/ship/audio/AudioPlayer.h
++++ b/include/ship/audio/AudioPlayer.h
+@@ -177,3 +177,6 @@ class AudioPlayer {
+ 
+ #include "SDLAudioPlayer.h"
+ #include "NullAudioPlayer.h"
++#ifdef __ORBIS__
++#include "Ps4AudioPlayer.h"
++#endif
+diff --git a/include/ship/audio/Ps4AudioPlayer.h b/include/ship/audio/Ps4AudioPlayer.h
+new file mode 100644
+index 00000000..5d2ef3ff
+--- /dev/null
++++ b/include/ship/audio/Ps4AudioPlayer.h
+@@ -0,0 +1,50 @@
++#pragma once
++#ifdef __ORBIS__
++#include "AudioPlayer.h"
++
++#include <atomic>
++#include <mutex>
++#include <thread>
++#include <vector>
++
++namespace Ship {
++/**
++ * @brief AudioPlayer on the PS4's sceAudioOut.
++ *
++ * PacBrew's SDL2 has no working audio output on the console, so the game's stream goes straight
++ * to a main-type audio port. The game produces 32 kHz (AudioSettings::SampleRate) and sceAudioOut
++ * runs at 48 kHz only: DoPlay queues the game's frames in a ring, and an output thread resamples
++ * them (linear) into 256-sample grains, each sceAudioOutOutput call blocking for one grain.
++ */
++class Ps4AudioPlayer final : public AudioPlayer {
++  public:
++    Ps4AudioPlayer(AudioSettings settings) : AudioPlayer(settings) {
++    }
++    ~Ps4AudioPlayer();
++
++    /** @brief Frames (at the game's rate) queued and not yet played. */
++    int Buffered() override;
++
++    const char* GetBackendName() const override {
++        return "sceAudioOut";
++    }
++
++  protected:
++    bool DoInit() override;
++    void DoClose() override;
++    void DoPlay(const uint8_t* buf, size_t len) override;
++
++  private:
++    void OutputLoop();
++
++    int32_t mPort = -1;
++    int32_t mNumChannels = 2;
++    std::thread mThread;
++    std::atomic<bool> mRunning{ false };
++    std::mutex mMutex;
++    std::vector<int16_t> mRing; // stereo frames at the game's rate
++    size_t mRead = 0;           // frame index
++    size_t mCount = 0;          // frames queued
++};
++} // namespace Ship
++#endif
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index a1c6aaa5..860a230f 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -211,6 +211,14 @@ if (CMAKE_SYSTEM_NAME STREQUAL "iOS")
+             XCODE_ATTRIBUTE_CODE_SIGNING_ALLOWED "NO"
+         )
+     endif()
++elseif(PS4)
++    # Vulkan (Mesa RADV on GNM) presenting through VideoOut: gfx_vulkan.cpp + gfx_ps4.cpp.
++    target_compile_definitions(libultraship PUBLIC ENABLE_VULKAN)
++    target_compile_definitions(libultraship PRIVATE
++        $<$<CONFIG:Debug>:_DEBUG>
++        $<$<NOT:$<CONFIG:Debug>>:NDEBUG>
++        SPDLOG_ACTIVE_LEVEL=${SPDLOG_MIN_CUTOFF}
++    )
+ else()
+     target_compile_definitions(libultraship PRIVATE
+         ENABLE_OPENGL
+diff --git a/src/fast/Fast3dGui.cpp b/src/fast/Fast3dGui.cpp
+index 16a88cf9..439190b0 100644
+--- a/src/fast/Fast3dGui.cpp
++++ b/src/fast/Fast3dGui.cpp
+@@ -20,6 +20,10 @@
+ #include <SDL2/SDL_video.h>
+ #endif
+ 
++#ifdef ENABLE_VULKAN
++#include "fast/backends/gfx_vulkan.h"
++#endif
++
+ #if defined(__ANDROID__) || defined(__IOS__)
+ #include "ship/port/mobile/MobileImpl.h"
+ #endif
+@@ -64,7 +68,7 @@ bool Fast3dGui::SupportsViewports() {
+     }
+ #endif
+ 
+-#if defined(__ANDROID__) || defined(__IOS__)
++#if defined(__ANDROID__) || defined(__IOS__) || defined(ENABLE_VULKAN)
+     return false;
+ #endif
+ 
+@@ -74,6 +78,7 @@ bool Fast3dGui::SupportsViewports() {
+ void Fast3dGui::HandleWindowEvents(Fast::WindowEvent event) {
+     auto window = Ship::Context::GetInstance()->GetWindow();
+     switch (window->GetWindowBackend()) {
++#if defined(ENABLE_OPENGL) || defined(__APPLE__)
+         case WindowBackend::FAST3D_SDL_OPENGL:
+         case WindowBackend::FAST3D_SDL_METAL:
+             ImGui_ImplSDL2_ProcessEvent(static_cast<const SDL_Event*>(event.Sdl.Event));
+@@ -81,6 +86,7 @@ void Fast3dGui::HandleWindowEvents(Fast::WindowEvent event) {
+             Ship::Mobile::ImGuiProcessEvent(ImGui::GetIO().WantTextInput);
+ #endif
+             break;
++#endif
+ #ifdef ENABLE_DX11
+         case WindowBackend::FAST3D_DXGI_DX11:
+             ImGui_ImplWin32_WndProcHandler(static_cast<HWND>(event.Win32.Handle), event.Win32.Msg, event.Win32.Param1,
+@@ -97,6 +103,16 @@ void Fast3dGui::ImGuiWMInit() {
+     mInterpreter = std::dynamic_pointer_cast<Fast3dWindow>(window)->GetInterpreterWeak();
+ 
+     switch (window->GetWindowBackend()) {
++#ifdef ENABLE_VULKAN
++        case WindowBackend::FAST3D_PS4_VULKAN: {
++            // No platform backend: the display size is fixed and set here and every frame.
++            ImGuiIO& io = ImGui::GetIO();
++            io.BackendPlatformName = "gdiffuser_ps4";
++            io.DisplaySize = ImVec2((float)mImpl.Ps4.Width, (float)mImpl.Ps4.Height);
++            break;
++        }
++#endif
++#ifdef ENABLE_OPENGL
+         case WindowBackend::FAST3D_SDL_OPENGL:
+             // Touch reaches ImGui through the SDL_FINGER translation in gfx_sdl2.cpp, which decides
+             // per gesture whether to drive the pointer or leave it to a platform that emulates one
+@@ -109,6 +125,7 @@ void Fast3dGui::ImGuiWMInit() {
+             }
+             ImGui_ImplSDL2_InitForOpenGL(static_cast<SDL_Window*>(mImpl.Opengl.Window), mImpl.Opengl.Context);
+             break;
++#endif
+ #if __APPLE__
+         case WindowBackend::FAST3D_SDL_METAL:
+             SDL_SetHint(SDL_HINT_TOUCH_MOUSE_EVENTS, "0");
+@@ -160,6 +177,11 @@ void Fast3dGui::ImGuiWMShutdown() {
+ void Fast3dGui::ImGuiBackendInit() {
+     auto window = Ship::Context::GetInstance()->GetWindow();
+     switch (window->GetWindowBackend()) {
++#ifdef ENABLE_VULKAN
++        case WindowBackend::FAST3D_PS4_VULKAN:
++            ((GfxRenderingAPIVulkan*)mInterpreter.lock()->GetCurrentRenderingAPI())->ImGuiInit();
++            break;
++#endif
+ #ifdef ENABLE_OPENGL
+         case WindowBackend::FAST3D_SDL_OPENGL:
+ #ifdef __APPLE__
+@@ -194,6 +216,13 @@ void Fast3dGui::ImGuiBackendInit() {
+ void Fast3dGui::ImGuiBackendShutdown() {
+     // Same rule as ImGuiWMShutdown: cached backend, no singleton re-fetch mid-destruction.
+     switch (mCachedBackend) {
++#ifdef ENABLE_VULKAN
++        case WindowBackend::FAST3D_PS4_VULKAN:
++            if (auto interpreter = mInterpreter.lock()) {
++                ((GfxRenderingAPIVulkan*)interpreter->GetCurrentRenderingAPI())->ImGuiShutdown();
++            }
++            break;
++#endif
+ #ifdef ENABLE_OPENGL
+         case WindowBackend::FAST3D_SDL_OPENGL:
+             ImGui_ImplOpenGL3_Shutdown();
+@@ -217,6 +246,11 @@ void Fast3dGui::ImGuiBackendShutdown() {
+ void Fast3dGui::ImGuiBackendNewFrame() {
+     auto window = Ship::Context::GetInstance()->GetWindow();
+     switch (window->GetWindowBackend()) {
++#ifdef ENABLE_VULKAN
++        case WindowBackend::FAST3D_PS4_VULKAN:
++            ((GfxRenderingAPIVulkan*)mInterpreter.lock()->GetCurrentRenderingAPI())->ImGuiNewFrame();
++            break;
++#endif
+ #ifdef ENABLE_OPENGL
+         case WindowBackend::FAST3D_SDL_OPENGL:
+             ImGui_ImplOpenGL3_NewFrame();
+@@ -244,10 +278,20 @@ void Fast3dGui::ImGuiBackendNewFrame() {
+ void Fast3dGui::ImGuiWMNewFrame() {
+     auto window = Ship::Context::GetInstance()->GetWindow();
+     switch (window->GetWindowBackend()) {
++#ifdef ENABLE_VULKAN
++        case WindowBackend::FAST3D_PS4_VULKAN: {
++            ImGuiIO& io = ImGui::GetIO();
++            io.DisplaySize = ImVec2((float)mImpl.Ps4.Width, (float)mImpl.Ps4.Height);
++            io.DisplayFramebufferScale = ImVec2(1.0f, 1.0f);
++            io.DeltaTime = 1.0f / 60.0f;
++            break;
++        }
++#else
+         case WindowBackend::FAST3D_SDL_OPENGL:
+         case WindowBackend::FAST3D_SDL_METAL:
+             ImGui_ImplSDL2_NewFrame();
+             break;
++#endif
+ #ifdef ENABLE_DX11
+         case WindowBackend::FAST3D_DXGI_DX11:
+             ImGui_ImplWin32_NewFrame();
+@@ -267,12 +311,19 @@ void Fast3dGui::RefreshImGuiGamepads() {
+         return;
+     }
+ 
++#if defined(ENABLE_OPENGL) || defined(__APPLE__)
+     ImGui_ImplSDL2_SetGamepadMode(ImGui_ImplSDL2_GamepadMode_AutoAll, nullptr, 0);
++#endif
+ }
+ 
+ void Fast3dGui::ImGuiRenderDrawData(ImDrawData* data) {
+     auto window = Ship::Context::GetInstance()->GetWindow();
+     switch (window->GetWindowBackend()) {
++#ifdef ENABLE_VULKAN
++        case WindowBackend::FAST3D_PS4_VULKAN:
++            ((GfxRenderingAPIVulkan*)mInterpreter.lock()->GetCurrentRenderingAPI())->ImGuiRender(data);
++            break;
++#endif
+ #ifdef ENABLE_OPENGL
+         case WindowBackend::FAST3D_SDL_OPENGL:
+             ImGui_ImplOpenGL3_RenderDrawData(data);
+diff --git a/src/fast/Fast3dWindow.cpp b/src/fast/Fast3dWindow.cpp
+index ac78014a..410f0738 100644
+--- a/src/fast/Fast3dWindow.cpp
++++ b/src/fast/Fast3dWindow.cpp
+@@ -12,6 +12,8 @@
+ #include "fast/backends/gfx_direct3d_common.h"
+ #include "fast/backends/gfx_direct3d11.h"
+ #include "fast/backends/gfx_window_manager_api.h"
++#include "fast/backends/gfx_vulkan.h"
++#include "fast/backends/gfx_ps4.h"
+ 
+ #include "fast/Fast3dGui.h"
+ 
+@@ -36,7 +38,11 @@ Fast3dWindow::Fast3dWindow(std::shared_ptr<Ship::Gui> gui, std::shared_ptr<FastM
+         AddAvailableWindowBackend(WindowBackend::FAST3D_SDL_METAL);
+     }
+ #endif
++#ifdef ENABLE_VULKAN
++    AddAvailableWindowBackend(WindowBackend::FAST3D_PS4_VULKAN);
++#else
+     AddAvailableWindowBackend(WindowBackend::FAST3D_SDL_OPENGL);
++#endif
+ }
+ 
+ Fast3dWindow::Fast3dWindow(std::shared_ptr<Ship::Gui> gui)
+@@ -152,6 +158,12 @@ void Fast3dWindow::InitWindowManager() {
+             mRenderingApi = new GfxRenderingAPIMetal();
+             mWindowManagerApi = new GfxWindowBackendSDL2();
+             break;
++#endif
++#ifdef ENABLE_VULKAN
++        case WindowBackend::FAST3D_PS4_VULKAN:
++            mRenderingApi = new GfxRenderingAPIVulkan();
++            mWindowManagerApi = new GfxWindowBackendPS4();
++            break;
+ #endif
+         default:
+             SPDLOG_ERROR("Could not load the correct rendering backend");
+diff --git a/src/fast/backends/gfx_ps4.cpp b/src/fast/backends/gfx_ps4.cpp
+new file mode 100644
+index 00000000..1c0f94d2
+--- /dev/null
++++ b/src/fast/backends/gfx_ps4.cpp
+@@ -0,0 +1,161 @@
++#ifdef ENABLE_VULKAN
++#include "fast/backends/gfx_ps4.h"
++#include "fast/backends/gfx_vulkan.h"
++
++#include <SDL2/SDL.h>
++
++#include <chrono>
++
++namespace Fast {
++
++void GfxWindowBackendPS4::Init(const char* gameName, const char* apiName, bool startFullScreen, uint32_t width,
++                               uint32_t height, int32_t posX, int32_t posY) {
++    // Video stays off: SDL's PS4 video driver needs Piglet. Joystick (ScePad) and events only;
++    // the audio player starts SDL's audio subsystem itself.
++    SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
++    SDL_InitSubSystem(SDL_INIT_EVENTS | SDL_INIT_JOYSTICK | SDL_INIT_GAMECONTROLLER);
++    mFullScreen = true;
++    mIsRunning = true;
++    // The GUI is initialised by GfxRenderingAPIVulkan::Init, once the device exists (the
++    // interpreter initialises this backend first).
++}
++
++void GfxWindowBackendPS4::Close() {
++    mIsRunning = false;
++}
++
++void GfxWindowBackendPS4::SetKeyboardCallbacks(bool (*onKeyDown)(int scancode), bool (*onKeyUp)(int scancode),
++                                               void (*onAllKeysUp)()) {
++    mOnKeyDown = onKeyDown;
++    mOnKeyUp = onKeyUp;
++}
++
++void GfxWindowBackendPS4::SetMouseCallbacks(bool (*onMouseButtonDown)(int btn), bool (*onMouseButtonUp)(int btn)) {
++    mOnMouseButtonDown = onMouseButtonDown;
++    mOnMouseButtonUp = onMouseButtonUp;
++}
++
++void GfxWindowBackendPS4::SetFullscreenChangedCallback(void (*onFullscreenChanged)(bool is_now_fullscreen)) {
++    mOnFullscreenChanged = onFullscreenChanged;
++}
++
++void GfxWindowBackendPS4::SetFullscreen(bool fullscreen) {
++}
++
++void GfxWindowBackendPS4::GetActiveWindowRefreshRate(uint32_t* refreshRate) {
++    *refreshRate = 60;
++}
++
++void GfxWindowBackendPS4::SetCursorVisibility(bool visibility) {
++}
++
++void GfxWindowBackendPS4::SetMousePos(int32_t posX, int32_t posY) {
++}
++
++void GfxWindowBackendPS4::GetMousePos(int32_t* x, int32_t* y) {
++    *x = 0;
++    *y = 0;
++}
++
++void GfxWindowBackendPS4::GetMouseDelta(int32_t* x, int32_t* y) {
++    *x = 0;
++    *y = 0;
++}
++
++void GfxWindowBackendPS4::GetMouseWheel(float* x, float* y) {
++    *x = 0.0f;
++    *y = 0.0f;
++}
++
++bool GfxWindowBackendPS4::GetMouseState(uint32_t btn) {
++    return false;
++}
++
++void GfxWindowBackendPS4::SetMouseCapture(bool capture) {
++}
++
++bool GfxWindowBackendPS4::IsMouseCaptured() {
++    return false;
++}
++
++void GfxWindowBackendPS4::SetMouseGrab(bool grab) {
++}
++
++void GfxWindowBackendPS4::GetDimensions(uint32_t* width, uint32_t* height, int32_t* posX, int32_t* posY) {
++    GfxRenderingAPIVulkan::GetOutputSize(width, height);
++    *posX = 0;
++    *posY = 0;
++}
++
++void GfxWindowBackendPS4::SetDimensions(uint32_t width, uint32_t height, int32_t posX, int32_t posY) {
++}
++
++Ship::WindowRect GfxWindowBackendPS4::GetPrimaryMonitorRect() {
++    uint32_t w, h;
++    GfxRenderingAPIVulkan::GetOutputSize(&w, &h);
++    return { 0, 0, (int32_t)w, (int32_t)h };
++}
++
++void GfxWindowBackendPS4::HandleEvents() {
++    // Controller add/remove events stay queued for libultraship's device manager, as in the
++    // SDL2 backend; everything else is drained.
++    SDL_Event event;
++    SDL_PumpEvents();
++    while (SDL_PeepEvents(&event, 1, SDL_GETEVENT, SDL_FIRSTEVENT, SDL_CONTROLLERDEVICEADDED - 1) > 0) {
++        if (event.type == SDL_QUIT) {
++            Close();
++        }
++    }
++    while (SDL_PeepEvents(&event, 1, SDL_GETEVENT, SDL_CONTROLLERDEVICEREMOVED + 1, SDL_LASTEVENT) > 0) {
++    }
++}
++
++bool GfxWindowBackendPS4::IsFrameReady() {
++    return true;
++}
++
++void GfxWindowBackendPS4::SwapBuffersBegin() {
++    // Presentation is GfxRenderingAPIVulkan::FinishRender (a VSYNC flip; waiting for a free
++    // VideoOut buffer paces the loop to the display).
++}
++
++void GfxWindowBackendPS4::SwapBuffersEnd() {
++}
++
++double GfxWindowBackendPS4::GetTime() {
++    using namespace std::chrono;
++    return duration_cast<duration<double>>(steady_clock::now().time_since_epoch()).count();
++}
++
++int GfxWindowBackendPS4::GetTargetFps() {
++    return mTargetFps;
++}
++
++void GfxWindowBackendPS4::SetTargetFps(int fps) {
++    mTargetFps = fps;
++}
++
++void GfxWindowBackendPS4::SetMaxFrameLatency(int latency) {
++}
++
++const char* GfxWindowBackendPS4::GetKeyName(int scancode) {
++    return "";
++}
++
++bool GfxWindowBackendPS4::CanDisableVsync() {
++    return false;
++}
++
++bool GfxWindowBackendPS4::IsRunning() {
++    return mIsRunning;
++}
++
++void GfxWindowBackendPS4::Destroy() {
++}
++
++bool GfxWindowBackendPS4::IsFullscreen() {
++    return true;
++}
++
++} // namespace Fast
++#endif
+diff --git a/src/fast/backends/gfx_vulkan.cpp b/src/fast/backends/gfx_vulkan.cpp
+new file mode 100644
+index 00000000..0e95f0d8
+--- /dev/null
++++ b/src/fast/backends/gfx_vulkan.cpp
+@@ -0,0 +1,2483 @@
++// Fast3D on Vulkan for the PS4 (see gfx_vulkan.h).
++//
++// Frame structure. The interpreter drives one present per Run(): StartFrame, draws into an
++// offscreen framebuffer or straight into framebuffer 0, the GUI composites into framebuffer 0,
++// then EndFrame -> FinishRender. Commands are recorded into two command buffers per frame:
++// `upload` (texture uploads and first-use layout transitions; uploads arrive in the middle of
++// render passes, where copies are not allowed) and `cmd` (everything else). Both go to the queue
++// in one submission, upload first, and FinishRender queues the VideoOut flip behind them.
++//
++// Layouts. Render-target color images (including the VideoOut buffers) stay in GENERAL, so they
++// can be sampled, copied and drawn to without transitions; the render passes' external
++// dependencies order the writes against later reads. Textures are SHADER_READ_ONLY_OPTIMAL,
++// depth images DEPTH_STENCIL_ATTACHMENT_OPTIMAL.
++//
++// Shaders. The OpenGL backend's template (shaders/opengl/default.shader.glsl) is expanded with
++// GLSL 4.50 settings and then rewritten for Vulkan: explicit locations for inputs and varyings,
++// fixed sampler bindings (texture unit = binding), and the loose uniforms replaced by one push
++// constant block. glslang compiles the result to SPIR-V; RADV/ACO compiles that on the console.
++#ifdef ENABLE_VULKAN
++
++#ifndef VK_NO_PROTOTYPES
++#define VK_NO_PROTOTYPES
++#endif
++#include "fast/backends/gfx_vulkan.h"
++#include "fast/backends/gfx_vulkan_shader.h"
++
++#include <vulkan/vulkan_core.h>
++
++#define VMA_STATIC_VULKAN_FUNCTIONS 0
++#define VMA_DYNAMIC_VULKAN_FUNCTIONS 1
++#define VMA_IMPLEMENTATION
++#include <vk_mem_alloc.h>
++
++#include <imgui.h>
++#include <imgui_impl_vulkan.h>
++
++#include <glslang/Public/ResourceLimits.h>
++#include <glslang/Public/ShaderLang.h>
++#include <SPIRV/GlslangToSpv.h>
++#include <prism/processor.h>
++
++#include <algorithm>
++#include <array>
++#include <cstdarg>
++#include <cstdio>
++#include <cstring>
++#include <fstream>
++#include <functional>
++#include <optional>
++#include <regex>
++#include <sstream>
++#include <string>
++
++#include <orbis/VideoOut.h>
++#include <orbis/libkernel.h>
++#include <sys/stat.h>
++#include <vector>
++
++#include "ship/Context.h"
++#include "ship/resource/factory/ShaderFactory.h"
++#include "ship/config/ConsoleVariable.h"
++#include "libultraship/bridge/consolevariablebridge.h"
++#include "fast/interpreter.h"
++#include "fast/Fast3dGui.h"
++#include "ship/window/Window.h"
++#include "spdlog/spdlog.h"
++
++// Mesa (RADV) is linked into the executable; there is no Vulkan loader on the PS4.
++extern "C" VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vk_icdGetInstanceProcAddr(VkInstance instance, const char* name);
++extern "C" VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vk_common_GetDeviceProcAddr(VkDevice device, const char* name);
++// DolphinPS4 port/mesa/ac_ps4_drm.c: queue a VideoOut flip behind everything submitted so far.
++extern "C" int ac_ps4_submit_flip(int video, unsigned buffer, unsigned mode, int64_t arg);
++// G-Diffuser-PS4 port/ps4_crashlog.cpp (weak: optional).
++extern "C" __attribute__((weak)) void ps4_boot_trace(const char* line);
++extern "C" int sceSysmoduleLoadModuleInternal(uint32_t id);
++extern "C" int sceUserServiceInitialize(void* params);
++
++namespace Fast {
++
++namespace {
++
++// ----------------------------------------------------------------------------------------------
++// Function table
++// ----------------------------------------------------------------------------------------------
++
++#define GDX_VK_INSTANCE_FUNCS(X)                                                                  \
++    X(vkDestroyInstance)                                                                          \
++    X(vkEnumeratePhysicalDevices)                                                                 \
++    X(vkGetPhysicalDeviceProperties)                                                              \
++    X(vkGetPhysicalDeviceFeatures)                                                                \
++    X(vkGetPhysicalDeviceQueueFamilyProperties)                                                   \
++    X(vkGetPhysicalDeviceMemoryProperties)                                                        \
++    X(vkGetPhysicalDeviceFormatProperties)                                                        \
++    X(vkEnumerateDeviceExtensionProperties)                                                       \
++    X(vkCreateDevice)                                                                             \
++    X(vkGetDeviceProcAddr)
++
++#define GDX_VK_DEVICE_FUNCS(X)                                                                    \
++    X(vkDestroyDevice)                                                                            \
++    X(vkGetDeviceQueue)                                                                           \
++    X(vkDeviceWaitIdle)                                                                           \
++    X(vkQueueSubmit)                                                                              \
++    X(vkCreateCommandPool)                                                                        \
++    X(vkDestroyCommandPool)                                                                       \
++    X(vkResetCommandPool)                                                                         \
++    X(vkAllocateCommandBuffers)                                                                   \
++    X(vkBeginCommandBuffer)                                                                       \
++    X(vkEndCommandBuffer)                                                                         \
++    X(vkCreateFence)                                                                              \
++    X(vkDestroyFence)                                                                             \
++    X(vkWaitForFences)                                                                            \
++    X(vkResetFences)                                                                              \
++    X(vkCreateImage)                                                                              \
++    X(vkDestroyImage)                                                                             \
++    X(vkGetImageMemoryRequirements)                                                               \
++    X(vkGetImageSubresourceLayout)                                                                \
++    X(vkAllocateMemory)                                                                           \
++    X(vkFreeMemory)                                                                               \
++    X(vkMapMemory)                                                                                \
++    X(vkBindImageMemory)                                                                          \
++    X(vkCreateImageView)                                                                          \
++    X(vkDestroyImageView)                                                                         \
++    X(vkCreateSampler)                                                                            \
++    X(vkDestroySampler)                                                                           \
++    X(vkCreateRenderPass)                                                                         \
++    X(vkDestroyRenderPass)                                                                        \
++    X(vkCreateFramebuffer)                                                                        \
++    X(vkDestroyFramebuffer)                                                                       \
++    X(vkCreateShaderModule)                                                                       \
++    X(vkDestroyShaderModule)                                                                      \
++    X(vkCreatePipelineLayout)                                                                     \
++    X(vkDestroyPipelineLayout)                                                                    \
++    X(vkCreateGraphicsPipelines)                                                                  \
++    X(vkDestroyPipeline)                                                                          \
++    X(vkCreatePipelineCache)                                                                      \
++    X(vkDestroyPipelineCache)                                                                     \
++    X(vkGetPipelineCacheData)                                                                     \
++    X(vkCreateDescriptorSetLayout)                                                                \
++    X(vkDestroyDescriptorSetLayout)                                                               \
++    X(vkCreateDescriptorPool)                                                                     \
++    X(vkDestroyDescriptorPool)                                                                    \
++    X(vkResetDescriptorPool)                                                                      \
++    X(vkAllocateDescriptorSets)                                                                   \
++    X(vkUpdateDescriptorSets)                                                                     \
++    X(vkCmdBeginRenderPass)                                                                       \
++    X(vkCmdEndRenderPass)                                                                         \
++    X(vkCmdBindPipeline)                                                                          \
++    X(vkCmdBindVertexBuffers)                                                                     \
++    X(vkCmdBindDescriptorSets)                                                                    \
++    X(vkCmdPushConstants)                                                                         \
++    X(vkCmdSetViewport)                                                                           \
++    X(vkCmdSetScissor)                                                                            \
++    X(vkCmdSetDepthBias)                                                                          \
++    X(vkCmdDraw)                                                                                  \
++    X(vkCmdClearAttachments)                                                                      \
++    X(vkCmdClearColorImage)                                                                       \
++    X(vkCmdPipelineBarrier)                                                                       \
++    X(vkCmdCopyBufferToImage)                                                                     \
++    X(vkCmdCopyImage)                                                                             \
++    X(vkCmdBlitImage)                                                                             \
++    X(vkCmdCopyImageToBuffer)
++
++PFN_vkCreateInstance vkCreateInstance;
++#define GDX_VK_DECLARE(name) PFN_##name name;
++GDX_VK_INSTANCE_FUNCS(GDX_VK_DECLARE)
++GDX_VK_DEVICE_FUNCS(GDX_VK_DECLARE)
++#undef GDX_VK_DECLARE
++
++void Trace(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
++void Trace(const char* fmt, ...) {
++    char line[512];
++    va_list args;
++    va_start(args, fmt);
++    vsnprintf(line, sizeof(line), fmt, args);
++    va_end(args);
++    SPDLOG_INFO("[vulkan] {}", line);
++    if (ps4_boot_trace != nullptr) {
++        std::string withNewline = std::string("vulkan: ") + line + "\n";
++        ps4_boot_trace(withNewline.c_str());
++    }
++}
++
++#define VK_CHECK(call)                                                                            \
++    do {                                                                                          \
++        VkResult r_ = (call);                                                                     \
++        if (r_ != VK_SUCCESS) {                                                                   \
++            Trace("%s failed: %d (%s:%d)", #call, (int)r_, __FILE__, __LINE__);                   \
++        }                                                                                         \
++    } while (0)
++
++// ----------------------------------------------------------------------------------------------
++// Constants and small types
++// ----------------------------------------------------------------------------------------------
++
++constexpr uint32_t kFrames = 2;     // frames in flight (CPU recording ahead of the GPU)
++constexpr uint32_t kSwapImages = 3; // VideoOut buffers, as in DolphinPS4
++constexpr uint32_t kOutW = 1920, kOutH = 1080;
++constexpr VkDeviceSize kVideoOutAlign = 2 << 20; // VideoOut buffers must be 2 MiB aligned
++constexpr VkFormat kColorFormat = VK_FORMAT_R8G8B8A8_UNORM;
++constexpr VkFormat kDepthFormat = VK_FORMAT_D32_SFLOAT;
++constexpr uint32_t kSetsPerPool = 4096;
++
++// Mirrors the push constant block injected into every fragment shader (RewriteForVulkan).
++struct PushConstants {
++    int32_t frame_count;
++    float noise_scale;
++    float prim_depth;
++    float alpha_compare_threshold;
++    int32_t texture_width[2];
++    int32_t texture_height[2];
++    int32_t texture_filtering[2];
++};
++static_assert(sizeof(PushConstants) == 40, "push constant layout");
++
++
++struct ShaderProgramVk {
++    uint32_t index;
++    uint8_t numInputs;
++    bool usedTextures[SHADER_MAX_TEXTURES];
++    uint8_t numFloats;
++    uint8_t numAttribs;
++    uint8_t attribSizes[16];
++    bool blend;
++    VkShaderModule vs = VK_NULL_HANDLE;
++    VkShaderModule fs = VK_NULL_HANDLE;
++};
++
++struct VkTex {
++    VkImage image = VK_NULL_HANDLE;
++    VmaAllocation alloc = VK_NULL_HANDLE;
++    VkImageView view = VK_NULL_HANDLE;
++    VkImageLayout layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
++    uint32_t width = 0, height = 0;
++    bool linear = false; // linear_filter from SetSamplerParameters
++    uint32_t cms = 0, cmt = 0;
++    int32_t filtering = FILTER_THREE_POINT; // what the shader's texture_filtering[] reads (OpenGL semantics)
++    uint64_t lastUse = 0;                    // frame serial of the last draw that sampled it
++    VkDescriptorSet imgui = VK_NULL_HANDLE;  // ImGui texture id, created on demand
++    bool isFramebuffer = false;
++};
++
++struct Framebuffer {
++    uint32_t width = 0, height = 0;
++    bool hasDepth = false;
++    bool isSwap = false; // framebuffer 0: the VideoOut buffers
++    uint32_t colorTex = 0; // index into textures (offscreen framebuffers)
++    VkImage depth = VK_NULL_HANDLE;
++    VmaAllocation depthAlloc = VK_NULL_HANDLE;
++    VkImageView depthView = VK_NULL_HANDLE;
++    VkFramebuffer fb[kSwapImages] = {};
++};
++
++struct SwapImage {
++    VkImage image = VK_NULL_HANDLE;
++    VkDeviceMemory memory = VK_NULL_HANDLE;
++    VkImageView view = VK_NULL_HANDLE;
++    void* address = nullptr;
++};
++
++struct BufferChunk {
++    VkBuffer buffer = VK_NULL_HANDLE;
++    VmaAllocation alloc = VK_NULL_HANDLE;
++    uint8_t* map = nullptr;
++    VkDeviceSize size = 0, used = 0;
++};
++
++// Per-frame linear allocator over host-visible buffers; reset when the frame slot is reused.
++struct Ring {
++    VkBufferUsageFlags usage = 0;
++    VkDeviceSize chunkSize = 0;
++    std::vector<BufferChunk> chunks;
++    size_t current = 0;
++};
++
++struct Frame {
++    VkCommandPool pool = VK_NULL_HANDLE;
++    VkCommandBuffer cmd = VK_NULL_HANDLE;
++    VkCommandBuffer upload = VK_NULL_HANDLE;
++    VkFence fence = VK_NULL_HANDLE;
++    bool pending = false;
++    Ring vertices, staging;
++    std::vector<VkDescriptorPool> pools;
++    size_t poolIndex = 0;
++    std::vector<std::function<void()>> garbage;
++};
++
++struct SetKey {
++    std::array<uint64_t, SHADER_MAX_TEXTURES * 2> v;
++    bool operator==(const SetKey& o) const {
++        return v == o.v;
++    }
++};
++struct SetKeyHash {
++    size_t operator()(const SetKey& k) const {
++        uint64_t h = 1469598103934665603ull;
++        for (uint64_t x : k.v) {
++            h ^= x;
++            h *= 1099511628211ull;
++        }
++        return (size_t)h;
++    }
++};
++
++VkSamplerAddressMode AddressMode(uint32_t cm, bool mirrorClampSupported) {
++    if (cm & G_TX_CLAMP) {
++        // N64 MIRROR|CLAMP mirrors once and then clamps (see the D3D11 backend).
++        if (cm & G_TX_MIRROR) {
++            return mirrorClampSupported ? VK_SAMPLER_ADDRESS_MODE_MIRROR_CLAMP_TO_EDGE
++                                        : VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT;
++        }
++        return VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
++    }
++    return (cm & G_TX_MIRROR) ? VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT : VK_SAMPLER_ADDRESS_MODE_REPEAT;
++}
++
++VkFormat AttribFormat(uint8_t size) {
++    switch (size) {
++        case 1:
++            return VK_FORMAT_R32_SFLOAT;
++        case 2:
++            return VK_FORMAT_R32G32_SFLOAT;
++        case 3:
++            return VK_FORMAT_R32G32B32_SFLOAT;
++        default:
++            return VK_FORMAT_R32G32B32A32_SFLOAT;
++    }
++}
++
++// Shader template resources (the text itself is built by gfx_vulkan_shader.cpp)
++
++std::shared_ptr<Ship::Shader> LoadShaderResource(const std::string& path) {
++    auto init = std::make_shared<Ship::ResourceInitData>();
++    init->Type = (uint32_t)Ship::ResourceType::Shader;
++    init->ByteOrder = Ship::Endianness::Native;
++    init->Format = RESOURCE_FORMAT_BINARY;
++    return std::static_pointer_cast<Ship::Shader>(
++        Ship::Context::GetInstance()->GetResourceManager()->LoadResource(path, true, init));
++}
++
++std::optional<std::string> IncludeLoader(const std::string& path) {
++    auto res = LoadShaderResource(path);
++    if (res == nullptr) {
++        return std::nullopt;
++    }
++    return *static_cast<std::string*>(res->GetRawPointer());
++}
++
++std::string ShaderTemplatePath(const CCFeatures& cc) {
++    const char* shaderName = gfx_get_shader(cc.shader_id);
++    return shaderName != nullptr ? std::string(shaderName) + ".glsl" : "shaders/opengl/default.shader.glsl";
++}
++
++std::vector<uint32_t> CompileSpv(const std::string& source, EShLanguage stage, std::string* error) {
++    static bool initialized = [] {
++        glslang::InitializeProcess();
++        return true;
++    }();
++    (void)initialized;
++
++    const char* strings[] = { source.c_str() };
++    glslang::TShader shader(stage);
++    shader.setStrings(strings, 1);
++    shader.setEnvInput(glslang::EShSourceGlsl, stage, glslang::EShClientVulkan, 100);
++    shader.setEnvClient(glslang::EShClientVulkan, glslang::EShTargetVulkan_1_1);
++    shader.setEnvTarget(glslang::EShTargetSpv, glslang::EShTargetSpv_1_3);
++    const EShMessages messages = (EShMessages)(EShMsgSpvRules | EShMsgVulkanRules);
++    if (!shader.parse(GetDefaultResources(), 450, false, messages)) {
++        *error = std::string("parse: ") + shader.getInfoLog();
++        return {};
++    }
++    glslang::TProgram program;
++    program.addShader(&shader);
++    if (!program.link(messages)) {
++        *error = std::string("link: ") + program.getInfoLog();
++        return {};
++    }
++    std::vector<uint32_t> spv;
++    glslang::SpvOptions options;
++    options.generateDebugInfo = false;
++    options.disableOptimizer = true;
++    glslang::GlslangToSpv(*program.getIntermediate(stage), spv, &options);
++    if (spv.empty()) {
++        *error = "empty SPIR-V";
++    }
++    return spv;
++}
++
++// For ImGui's loader: functions RADV does not expose here (the window-system ones ImGui's
++// helpers reference but this port never calls) resolve to a stub instead of failing the load.
++void MissingVulkanFunction() {
++    Trace("called a Vulkan function this device does not provide");
++}
++
++} // namespace
++
++// ----------------------------------------------------------------------------------------------
++// State
++// ----------------------------------------------------------------------------------------------
++
++struct VulkanState {
++    VkInstance instance = VK_NULL_HANDLE;
++    VkPhysicalDevice gpu = VK_NULL_HANDLE;
++    VkDevice device = VK_NULL_HANDLE;
++    VkQueue queue = VK_NULL_HANDLE;
++    uint32_t queueFamily = 0;
++    VkPhysicalDeviceProperties props = {};
++    bool depthClamp = false;
++    bool mirrorClamp = false;
++    VmaAllocator allocator = VK_NULL_HANDLE;
++
++    VkRenderPass renderPass[2] = {}; // [hasDepth]
++    VkDescriptorSetLayout setLayout = VK_NULL_HANDLE;
++    VkPipelineLayout pipelineLayout = VK_NULL_HANDLE;
++    VkPipelineCache pipelineCache = VK_NULL_HANDLE;
++    // FSR 1.0 (EASU upscale + RCAS sharpen) of the game framebuffer before ImGui composites it
++    VkPipeline fsrPipe[2] = {};
++    VkShaderModule fsrModules[3] = {};
++    int fsrFb[2] = { -1, -1 };
++    bool fsrFailed = false;
++    bool pipelineCacheDirty = false;
++    uint64_t pipelineCacheSavedSerial = 0;
++
++    // VideoOut
++    int video = -1;
++    int bufferSet = -1;
++    OrbisKernelEqueue flipQueue = 0;
++    SwapImage swap[kSwapImages];
++    uint32_t swapIndex = 0;
++    uint32_t lastPresented = 0; // VideoOut buffer of the last flip
++    uint64_t flipsSubmitted = 0;
++    VkTex frozen;               // CaptureLastFrame
++    bool vsync = true;
++
++    Frame frames[kFrames];
++    uint32_t frameIndex = 0;
++    uint64_t serial = 0; // frames begun
++    bool frameOpen = false;
++    std::unordered_map<SetKey, VkDescriptorSet, SetKeyHash> setCache;
++
++    std::vector<VkTex> textures; // [0]: 1x1 white, bound to unused sampler slots
++    std::vector<Framebuffer> framebuffers;
++    std::unordered_map<uint32_t, VkSampler> samplers;
++    VkSampler imguiSampler = VK_NULL_HANDLE;
++
++    std::map<std::pair<uint64_t, uint64_t>, ShaderProgramVk> programs;
++    uint32_t nextProgramIndex = 1;
++    std::unordered_map<uint64_t, VkPipeline> pipelines;
++
++    // Current state
++    ShaderProgramVk* program = nullptr;
++    uint32_t textureIds[SHADER_MAX_TEXTURES] = {};
++    int tile = 0;
++    int currentFb = 0;
++    uint32_t renderTargetWidth = kOutW, renderTargetHeight = kOutH;
++    bool inRenderPass = false;
++    int renderPassFb = -1;
++    VkPipeline boundPipeline = VK_NULL_HANDLE;
++    VkDescriptorSet boundSet = VK_NULL_HANDLE;
++    VkViewport viewport = { 0, 0, (float)kOutW, (float)kOutH, 0, 1 };
++    VkRect2D scissor = { { 0, 0 }, { kOutW, kOutH } };
++    bool viewportDirty = true, scissorDirty = true;
++    float depthBias = 0.0f;
++    bool depthBiasDirty = true;
++    FilteringMode filterMode = FILTER_THREE_POINT;
++    uint32_t frameCount = 0;
++    float noiseScale = 0.0f;
++
++    // Readback (ReadFramebufferToCPU / GetPixelDepth)
++    BufferChunk readback;
++
++    // ---- helpers ----
++    Frame& F() {
++        return frames[frameIndex];
++    }
++
++    void Retire(std::function<void()> fn) {
++        if (frameOpen) {
++            F().garbage.push_back(std::move(fn));
++        } else {
++            // Not recording: the last submitted frame may still use the object.
++            Frame& last = frames[(frameIndex + kFrames - 1) % kFrames];
++            if (last.pending) {
++                last.garbage.push_back(std::move(fn));
++            } else {
++                fn();
++            }
++        }
++    }
++
++    BufferChunk CreateHostBuffer(VkDeviceSize size, VkBufferUsageFlags usage, bool readback) {
++        BufferChunk c;
++        VkBufferCreateInfo info = { VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
++        info.size = size;
++        info.usage = usage;
++        VmaAllocationCreateInfo ainfo = {};
++        ainfo.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
++        ainfo.flags = VMA_ALLOCATION_CREATE_MAPPED_BIT | (readback ? VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT
++                                                                   : VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT);
++        VmaAllocationInfo out = {};
++        VK_CHECK(vmaCreateBuffer(allocator, &info, &ainfo, &c.buffer, &c.alloc, &out));
++        c.map = (uint8_t*)out.pMappedData;
++        c.size = size;
++        return c;
++    }
++
++    // Returns the buffer, offset and CPU pointer of `size` fresh bytes.
++    uint8_t* RingAlloc(Ring& ring, VkDeviceSize size, VkDeviceSize align, VkBuffer* buffer, VkDeviceSize* offset) {
++        while (true) {
++            if (ring.current < ring.chunks.size()) {
++                BufferChunk& c = ring.chunks[ring.current];
++                VkDeviceSize at = (c.used + align - 1) / align * align;
++                if (at + size <= c.size) {
++                    c.used = at + size;
++                    *buffer = c.buffer;
++                    *offset = at;
++                    return c.map + at;
++                }
++                ring.current++;
++                continue;
++            }
++            ring.chunks.push_back(CreateHostBuffer(std::max(ring.chunkSize, size), ring.usage, false));
++        }
++    }
++
++    void ResetRing(Ring& ring) {
++        for (auto& c : ring.chunks) {
++            c.used = 0;
++        }
++        ring.current = 0;
++    }
++
++    void Barrier(VkCommandBuffer cb, VkImage image, VkImageAspectFlags aspect, VkImageLayout from, VkImageLayout to,
++                 VkPipelineStageFlags srcStage, VkAccessFlags srcAccess, VkPipelineStageFlags dstStage,
++                 VkAccessFlags dstAccess) {
++        VkImageMemoryBarrier b = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
++        b.srcAccessMask = srcAccess;
++        b.dstAccessMask = dstAccess;
++        b.oldLayout = from;
++        b.newLayout = to;
++        b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
++        b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
++        b.image = image;
++        b.subresourceRange = { aspect, 0, 1, 0, 1 };
++        vkCmdPipelineBarrier(cb, srcStage, dstStage, 0, 0, nullptr, 0, nullptr, 1, &b);
++    }
++
++    void MemoryBarrier(VkCommandBuffer cb, VkPipelineStageFlags srcStage, VkAccessFlags srcAccess,
++                       VkPipelineStageFlags dstStage, VkAccessFlags dstAccess) {
++        VkMemoryBarrier b = { VK_STRUCTURE_TYPE_MEMORY_BARRIER };
++        b.srcAccessMask = srcAccess;
++        b.dstAccessMask = dstAccess;
++        vkCmdPipelineBarrier(cb, srcStage, dstStage, 0, 1, &b, 0, nullptr, 0, nullptr);
++    }
++
++    // ---- VideoOut ----
++    void WaitForSwapImageOffScreen() {
++        // With three buffers, the next one was shown by flip n-2 and replaced by flip n-1.
++        if (flipsSubmitted < 2) {
++            return;
++        }
++        const int64_t needed = (int64_t)(flipsSubmitted - 1);
++        for (int tries = 0; tries < 200; tries++) {
++            OrbisVideoOutFlipStatus status = {};
++            if (sceVideoOutGetFlipStatus(video, &status) < 0 || (int64_t)status.flipArg >= needed) {
++                return;
++            }
++            OrbisKernelEvent ev;
++            int count = 0;
++            OrbisKernelUseconds timeout = 5000;
++            sceKernelWaitEqueue(flipQueue, &ev, 1, &count, &timeout);
++        }
++    }
++
++    // ---- frames ----
++    void BeginCommandBuffers() {
++        Frame& f = F();
++        VkCommandBufferBeginInfo begin = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
++        begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
++        VK_CHECK(vkBeginCommandBuffer(f.upload, &begin));
++        VK_CHECK(vkBeginCommandBuffer(f.cmd, &begin));
++        inRenderPass = false;
++        renderPassFb = -1;
++        boundPipeline = VK_NULL_HANDLE;
++        boundSet = VK_NULL_HANDLE;
++        viewportDirty = scissorDirty = depthBiasDirty = true;
++    }
++
++    void BeginFrame() {
++        if (frameOpen) {
++            return;
++        }
++        Frame& f = F();
++        if (f.pending) {
++            VK_CHECK(vkWaitForFences(device, 1, &f.fence, VK_TRUE, UINT64_MAX));
++            VK_CHECK(vkResetFences(device, 1, &f.fence));
++            f.pending = false;
++        }
++        for (auto& fn : f.garbage) {
++            fn();
++        }
++        f.garbage.clear();
++        VK_CHECK(vkResetCommandPool(device, f.pool, 0));
++        for (auto pool : f.pools) {
++            VK_CHECK(vkResetDescriptorPool(device, pool, 0));
++        }
++        f.poolIndex = 0;
++        setCache.clear();
++        ResetRing(f.vertices);
++        ResetRing(f.staging);
++        serial++;
++        frameOpen = true;
++        BeginCommandBuffers();
++        WaitForSwapImageOffScreen();
++        swapIndex = (swapIndex + 1) % kSwapImages;
++    }
++
++    void Submit() {
++        Frame& f = F();
++        EndRenderPass();
++        VK_CHECK(vkEndCommandBuffer(f.upload));
++        VK_CHECK(vkEndCommandBuffer(f.cmd));
++        VkCommandBuffer cbs[2] = { f.upload, f.cmd };
++        VkSubmitInfo submit = { VK_STRUCTURE_TYPE_SUBMIT_INFO };
++        submit.commandBufferCount = 2;
++        submit.pCommandBuffers = cbs;
++        VK_CHECK(vkQueueSubmit(queue, 1, &submit, f.fence));
++        f.pending = true;
++    }
++
++    // Readbacks need the GPU's results now: submit what is recorded, wait, and keep recording the
++    // same frame (same VideoOut buffer, rings and descriptor pools) in fresh command buffers.
++    void SubmitAndWait() {
++        Frame& f = F();
++        Submit();
++        VK_CHECK(vkWaitForFences(device, 1, &f.fence, VK_TRUE, UINT64_MAX));
++        VK_CHECK(vkResetFences(device, 1, &f.fence));
++        f.pending = false;
++        VK_CHECK(vkResetCommandPool(device, f.pool, 0));
++        BeginCommandBuffers();
++    }
++
++    void Present() {
++        BeginFrame();
++        // The VideoOut buffer is read by the display engine after the GPU is done with it.
++        EndRenderPass();
++        MemoryBarrier(F().cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
++                      VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
++                      VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, VK_ACCESS_MEMORY_READ_BIT);
++        Submit();
++        const int mode = vsync ? ORBIS_VIDEO_OUT_FLIP_VSYNC : ORBIS_VIDEO_OUT_FLIP_HSYNC;
++        const int64_t arg = (int64_t)(flipsSubmitted + 1);
++        int r = ac_ps4_submit_flip(video, swapIndex, mode, arg);
++        if (r != 0) {
++            VK_CHECK(vkWaitForFences(device, 1, &F().fence, VK_TRUE, UINT64_MAX));
++            r = sceVideoOutSubmitFlip(video, (int)swapIndex, mode, arg);
++        }
++        if (r < 0) {
++            Trace("flip failed: %#x", (unsigned)r);
++        } else {
++            flipsSubmitted++;
++        }
++        if (flipsSubmitted <= 3) {
++            Trace("present %llu: buffer %u, %s flip", (unsigned long long)flipsSubmitted, swapIndex,
++                  r == 0 ? "GPU-side" : "CPU");
++        }
++        lastPresented = swapIndex;
++        frameOpen = false;
++        frameIndex = (frameIndex + 1) % kFrames;
++        if (pipelineCacheDirty && serial - pipelineCacheSavedSerial > 600) {
++            SavePipelineCache();
++        }
++    }
++
++    // ---- render passes ----
++    void EndRenderPass() {
++        if (inRenderPass) {
++            vkCmdEndRenderPass(F().cmd);
++            inRenderPass = false;
++            renderPassFb = -1;
++        }
++    }
++
++    VkImage ColorImage(int fbId) {
++        Framebuffer& fb = framebuffers[fbId];
++        return fb.isSwap ? swap[swapIndex].image : textures[fb.colorTex].image;
++    }
++
++    void EnsureRenderPass() {
++        BeginFrame();
++        if (inRenderPass && renderPassFb == currentFb) {
++            return;
++        }
++        EndRenderPass();
++        Framebuffer& fb = framebuffers[currentFb];
++        VkFramebuffer handle = fb.fb[fb.isSwap ? swapIndex : 0];
++        if (handle == VK_NULL_HANDLE) {
++            return; // not created yet (zero-sized); nothing can be drawn
++        }
++        VkRenderPassBeginInfo rp = { VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO };
++        rp.renderPass = renderPass[fb.hasDepth ? 1 : 0];
++        rp.framebuffer = handle;
++        rp.renderArea = { { 0, 0 }, { fb.width, fb.height } };
++        vkCmdBeginRenderPass(F().cmd, &rp, VK_SUBPASS_CONTENTS_INLINE);
++        inRenderPass = true;
++        renderPassFb = currentFb;
++        boundPipeline = VK_NULL_HANDLE; // pipelines are per render pass layout (depth or not)
++    }
++
++    // ---- textures ----
++    void DestroyTextureImage(VkTex& t) {
++        if (t.image == VK_NULL_HANDLE) {
++            return;
++        }
++        VkImage image = t.image;
++        VmaAllocation alloc = t.alloc;
++        VkImageView view = t.view;
++        VkDescriptorSet imgui = t.imgui;
++        VkDevice dev = device;
++        VmaAllocator vma = allocator;
++        Retire([=] {
++            if (imgui != VK_NULL_HANDLE) {
++                ImGui_ImplVulkan_RemoveTexture(imgui);
++            }
++            vkDestroyImageView(dev, view, nullptr);
++            vmaDestroyImage(vma, image, alloc);
++        });
++        t.image = VK_NULL_HANDLE;
++        t.alloc = VK_NULL_HANDLE;
++        t.view = VK_NULL_HANDLE;
++        t.imgui = VK_NULL_HANDLE;
++    }
++
++    void CreateImage(uint32_t w, uint32_t h, VkFormat format, VkImageUsageFlags usage, VkImageAspectFlags aspect,
++                     VkImage* image, VmaAllocation* alloc, VkImageView* view) {
++        VkImageCreateInfo info = { VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
++        info.imageType = VK_IMAGE_TYPE_2D;
++        info.format = format;
++        info.extent = { w, h, 1 };
++        info.mipLevels = 1;
++        info.arrayLayers = 1;
++        info.samples = VK_SAMPLE_COUNT_1_BIT;
++        info.tiling = VK_IMAGE_TILING_OPTIMAL;
++        info.usage = usage;
++        info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
++        VmaAllocationCreateInfo ainfo = {};
++        ainfo.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
++        VK_CHECK(vmaCreateImage(allocator, &info, &ainfo, image, alloc, nullptr));
++        VkImageViewCreateInfo vinfo = { VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
++        vinfo.image = *image;
++        vinfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
++        vinfo.format = format;
++        vinfo.subresourceRange = { aspect, 0, 1, 0, 1 };
++        VK_CHECK(vkCreateImageView(device, &vinfo, nullptr, view));
++    }
++
++    void Upload(VkTex& t, const uint8_t* rgba, uint32_t w, uint32_t h) {
++        BeginFrame();
++        // A texture already sampled this frame keeps its old image for those draws; give it a
++        // new one (the old one is destroyed once the frame has finished).
++        if (t.image == VK_NULL_HANDLE || t.width != w || t.height != h || t.lastUse == serial) {
++            DestroyTextureImage(t);
++            CreateImage(w, h, kColorFormat, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
++                        VK_IMAGE_ASPECT_COLOR_BIT, &t.image, &t.alloc, &t.view);
++        }
++        t.width = w;
++        t.height = h;
++        t.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
++        const VkDeviceSize size = (VkDeviceSize)w * h * 4;
++        VkBuffer buffer;
++        VkDeviceSize offset;
++        uint8_t* dst = RingAlloc(F().staging, size, 16, &buffer, &offset);
++        memcpy(dst, rgba, size);
++        VkCommandBuffer cb = F().upload;
++        Barrier(cb, t.image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
++                VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
++        VkBufferImageCopy region = {};
++        region.bufferOffset = offset;
++        region.imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
++        region.imageExtent = { w, h, 1 };
++        vkCmdCopyBufferToImage(cb, buffer, t.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
++        Barrier(cb, t.image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
++                VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
++                VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
++    }
++
++    VkSampler Sampler(bool linear, uint32_t cms, uint32_t cmt) {
++        const uint32_t key = (linear ? 1u : 0u) | (cms << 4) | (cmt << 8);
++        auto it = samplers.find(key);
++        if (it != samplers.end()) {
++            return it->second;
++        }
++        VkSamplerCreateInfo info = { VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO };
++        info.magFilter = info.minFilter = linear ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
++        info.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
++        info.addressModeU = AddressMode(cms, mirrorClamp);
++        info.addressModeV = AddressMode(cmt, mirrorClamp);
++        info.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
++        info.maxLod = VK_LOD_CLAMP_NONE;
++        VkSampler sampler;
++        VK_CHECK(vkCreateSampler(device, &info, nullptr, &sampler));
++        samplers[key] = sampler;
++        return sampler;
++    }
++
++    VkTex& Tex(uint32_t id) {
++        if (id >= textures.size() || textures[id].image == VK_NULL_HANDLE) {
++            return textures[0];
++        }
++        return textures[id];
++    }
++
++    // ---- framebuffers ----
++    void DestroyFramebufferObjects(Framebuffer& fb) {
++        VkDevice dev = device;
++        VmaAllocator vma = allocator;
++        for (auto& handle : fb.fb) {
++            if (handle != VK_NULL_HANDLE) {
++                VkFramebuffer h = handle;
++                Retire([=] { vkDestroyFramebuffer(dev, h, nullptr); });
++                handle = VK_NULL_HANDLE;
++            }
++        }
++        if (fb.depth != VK_NULL_HANDLE) {
++            VkImage image = fb.depth;
++            VmaAllocation alloc = fb.depthAlloc;
++            VkImageView view = fb.depthView;
++            Retire([=] {
++                vkDestroyImageView(dev, view, nullptr);
++                vmaDestroyImage(vma, image, alloc);
++            });
++            fb.depth = VK_NULL_HANDLE;
++            fb.depthAlloc = VK_NULL_HANDLE;
++            fb.depthView = VK_NULL_HANDLE;
++        }
++    }
++
++    void CreateDepth(Framebuffer& fb) {
++        CreateImage(fb.width, fb.height, kDepthFormat,
++                    VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
++                    VK_IMAGE_ASPECT_DEPTH_BIT, &fb.depth, &fb.depthAlloc, &fb.depthView);
++        Barrier(F().upload, fb.depth, VK_IMAGE_ASPECT_DEPTH_BIT, VK_IMAGE_LAYOUT_UNDEFINED,
++                VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0,
++                VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
++                VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT);
++    }
++
++    void CreateVkFramebuffer(Framebuffer& fb, uint32_t slot, VkImageView color) {
++        VkImageView views[2] = { color, fb.depthView };
++        VkFramebufferCreateInfo info = { VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO };
++        info.renderPass = renderPass[fb.hasDepth ? 1 : 0];
++        info.attachmentCount = fb.hasDepth ? 2 : 1;
++        info.pAttachments = views;
++        info.width = fb.width;
++        info.height = fb.height;
++        info.layers = 1;
++        VK_CHECK(vkCreateFramebuffer(device, &info, nullptr, &fb.fb[slot]));
++    }
++
++    // ---- pipelines ----
++    VkPipeline Pipeline(ShaderProgramVk* prg, bool depthTest, bool depthMask, bool decal, bool hasDepth) {
++        const uint64_t key = ((uint64_t)prg->index << 8) | (depthTest ? 1 : 0) | (depthMask ? 2 : 0) |
++                             (decal ? 4 : 0) | (hasDepth ? 8 : 0);
++        auto it = pipelines.find(key);
++        if (it != pipelines.end()) {
++            return it->second;
++        }
++        VkPipelineShaderStageCreateInfo stages[2] = { { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO },
++                                                      { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO } };
++        stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
++        stages[0].module = prg->vs;
++        stages[0].pName = "main";
++        stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
++        stages[1].module = prg->fs;
++        stages[1].pName = "main";
++
++        VkVertexInputBindingDescription binding = { 0, (uint32_t)prg->numFloats * 4, VK_VERTEX_INPUT_RATE_VERTEX };
++        VkVertexInputAttributeDescription attribs[16];
++        uint32_t pos = 0;
++        for (uint32_t i = 0; i < prg->numAttribs; i++) {
++            attribs[i] = { i, 0, AttribFormat(prg->attribSizes[i]), pos * 4 };
++            pos += prg->attribSizes[i];
++        }
++        VkPipelineVertexInputStateCreateInfo vi = { VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO };
++        vi.vertexBindingDescriptionCount = 1;
++        vi.pVertexBindingDescriptions = &binding;
++        vi.vertexAttributeDescriptionCount = prg->numAttribs;
++        vi.pVertexAttributeDescriptions = attribs;
++
++        VkPipelineInputAssemblyStateCreateInfo ia = { VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO };
++        ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
++        VkPipelineViewportStateCreateInfo vp = { VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO };
++        vp.viewportCount = 1;
++        vp.scissorCount = 1;
++        VkPipelineRasterizationStateCreateInfo rs = { VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO };
++        rs.depthClampEnable = depthClamp ? VK_TRUE : VK_FALSE; // D3D11: DepthClipEnable = false
++        rs.polygonMode = VK_POLYGON_MODE_FILL;
++        rs.cullMode = VK_CULL_MODE_NONE;
++        rs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
++        rs.depthBiasEnable = VK_TRUE; // set per draw (zero unless decal)
++        rs.lineWidth = 1.0f;
++        VkPipelineMultisampleStateCreateInfo ms = { VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO };
++        ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
++        VkPipelineDepthStencilStateCreateInfo ds = { VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO };
++        ds.depthTestEnable = (depthTest || depthMask) ? VK_TRUE : VK_FALSE;
++        ds.depthWriteEnable = depthMask ? VK_TRUE : VK_FALSE;
++        ds.depthCompareOp =
++            depthTest ? (decal ? VK_COMPARE_OP_LESS_OR_EQUAL : VK_COMPARE_OP_LESS) : VK_COMPARE_OP_ALWAYS;
++        VkPipelineColorBlendAttachmentState blend = {};
++        blend.colorWriteMask = 0xF;
++        if (prg->blend) {
++            // Colour blends conventionally; destination alpha is kept (targets are cleared to 1).
++            blend.blendEnable = VK_TRUE;
++            blend.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
++            blend.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
++            blend.colorBlendOp = VK_BLEND_OP_ADD;
++            blend.srcAlphaBlendFactor = VK_BLEND_FACTOR_ZERO;
++            blend.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
++            blend.alphaBlendOp = VK_BLEND_OP_ADD;
++        }
++        VkPipelineColorBlendStateCreateInfo cb = { VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO };
++        cb.attachmentCount = 1;
++        cb.pAttachments = &blend;
++        VkDynamicState dynamic[3] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR,
++                                      VK_DYNAMIC_STATE_DEPTH_BIAS };
++        VkPipelineDynamicStateCreateInfo dyn = { VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO };
++        dyn.dynamicStateCount = 3;
++        dyn.pDynamicStates = dynamic;
++
++        VkGraphicsPipelineCreateInfo info = { VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO };
++        info.stageCount = 2;
++        info.pStages = stages;
++        info.pVertexInputState = &vi;
++        info.pInputAssemblyState = &ia;
++        info.pViewportState = &vp;
++        info.pRasterizationState = &rs;
++        info.pMultisampleState = &ms;
++        info.pDepthStencilState = &ds;
++        info.pColorBlendState = &cb;
++        info.pDynamicState = &dyn;
++        info.layout = pipelineLayout;
++        info.renderPass = renderPass[hasDepth ? 1 : 0];
++        VkPipeline pipeline = VK_NULL_HANDLE;
++        const uint64_t t0 = sceKernelGetProcessTime();
++        VK_CHECK(vkCreateGraphicsPipelines(device, pipelineCache, 1, &info, nullptr, &pipeline));
++        static int sCount = 0;
++        if (++sCount <= 20 || sCount % 50 == 0) {
++            Trace("pipeline #%d (program %u, key %#llx) in %llu us", sCount, prg->index, (unsigned long long)key,
++                  (unsigned long long)(sceKernelGetProcessTime() - t0));
++        }
++        pipelines[key] = pipeline;
++        pipelineCacheDirty = true;
++        return pipeline;
++    }
++
++    std::string PipelineCachePath() {
++        return Ship::Context::GetPathRelativeToAppDirectory("vulkan-pipeline-cache.bin");
++    }
++
++    void LoadPipelineCache() {
++        std::vector<char> data;
++        std::ifstream in(PipelineCachePath(), std::ios::binary);
++        if (in) {
++            data.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
++        }
++        VkPipelineCacheCreateInfo info = { VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO };
++        info.initialDataSize = data.size();
++        info.pInitialData = data.empty() ? nullptr : data.data();
++        if (vkCreatePipelineCache(device, &info, nullptr, &pipelineCache) != VK_SUCCESS) {
++            info.initialDataSize = 0;
++            info.pInitialData = nullptr;
++            VK_CHECK(vkCreatePipelineCache(device, &info, nullptr, &pipelineCache));
++        }
++        Trace("pipeline cache: %zu bytes loaded", data.size());
++    }
++
++    void SavePipelineCache() {
++        size_t size = 0;
++        if (pipelineCache == VK_NULL_HANDLE || vkGetPipelineCacheData(device, pipelineCache, &size, nullptr) != VK_SUCCESS) {
++            return;
++        }
++        std::vector<char> data(size);
++        if (vkGetPipelineCacheData(device, pipelineCache, &size, data.data()) != VK_SUCCESS) {
++            return;
++        }
++        std::ofstream out(PipelineCachePath(), std::ios::binary | std::ios::trunc);
++        out.write(data.data(), (std::streamsize)size);
++        pipelineCacheDirty = false;
++        pipelineCacheSavedSerial = serial;
++    }
++
++    // ---- descriptor sets ----
++    VkDescriptorSet AllocateSet() {
++        Frame& f = F();
++        while (true) {
++            if (f.poolIndex == f.pools.size()) {
++                VkDescriptorPoolSize size = { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
++                                              kSetsPerPool * SHADER_MAX_TEXTURES };
++                VkDescriptorPoolCreateInfo info = { VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
++                info.maxSets = kSetsPerPool;
++                info.poolSizeCount = 1;
++                info.pPoolSizes = &size;
++                VkDescriptorPool pool;
++                VK_CHECK(vkCreateDescriptorPool(device, &info, nullptr, &pool));
++                f.pools.push_back(pool);
++            }
++            VkDescriptorSetAllocateInfo info = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
++            info.descriptorPool = f.pools[f.poolIndex];
++            info.descriptorSetCount = 1;
++            info.pSetLayouts = &setLayout;
++            VkDescriptorSet set;
++            if (vkAllocateDescriptorSets(device, &info, &set) == VK_SUCCESS) {
++                return set;
++            }
++            f.poolIndex++;
++        }
++    }
++};
++
++// ----------------------------------------------------------------------------------------------
++// GfxRenderingAPIVulkan
++// ----------------------------------------------------------------------------------------------
++
++GfxRenderingAPIVulkan::GfxRenderingAPIVulkan() : mState(std::make_unique<VulkanState>()) {
++}
++
++GfxRenderingAPIVulkan::~GfxRenderingAPIVulkan() {
++    VulkanState& s = *mState;
++    if (s.device != VK_NULL_HANDLE) {
++        vkDeviceWaitIdle(s.device);
++        s.SavePipelineCache();
++    }
++}
++
++void GfxRenderingAPIVulkan::GetOutputSize(uint32_t* width, uint32_t* height) {
++    *width = kOutW;
++    *height = kOutH;
++}
++
++const char* GfxRenderingAPIVulkan::GetName() {
++    return "Vulkan";
++}
++
++int GfxRenderingAPIVulkan::GetMaxTextureSize() {
++    return (int)std::min<uint32_t>(mState->props.limits.maxImageDimension2D, 8192);
++}
++
++GfxClipParameters GfxRenderingAPIVulkan::GetClipParameters() {
++    return { true, false };
++}
++
++void GfxRenderingAPIVulkan::Init() {
++    VulkanState& s = *mState;
++    sceSysmoduleLoadModuleInternal(0x80000010); // SystemService
++    sceSysmoduleLoadModuleInternal(0x80000011); // UserService
++    sceSysmoduleLoadModuleInternal(0x80000022); // VideoOut
++    sceUserServiceInitialize(nullptr);
++
++    vkCreateInstance = (PFN_vkCreateInstance)vk_icdGetInstanceProcAddr(VK_NULL_HANDLE, "vkCreateInstance");
++    VkApplicationInfo app = { VK_STRUCTURE_TYPE_APPLICATION_INFO };
++    app.pApplicationName = "G-Diffuser";
++    app.apiVersion = VK_API_VERSION_1_1;
++    VkInstanceCreateInfo iinfo = { VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO };
++    iinfo.pApplicationInfo = &app;
++    VK_CHECK(vkCreateInstance(&iinfo, nullptr, &s.instance));
++#define GDX_VK_LOAD_I(name) name = (PFN_##name)vk_icdGetInstanceProcAddr(s.instance, #name);
++    GDX_VK_INSTANCE_FUNCS(GDX_VK_LOAD_I)
++#undef GDX_VK_LOAD_I
++    if (vkGetDeviceProcAddr == nullptr) {
++        vkGetDeviceProcAddr = vk_common_GetDeviceProcAddr;
++    }
++
++    uint32_t count = 1;
++    VK_CHECK(vkEnumeratePhysicalDevices(s.instance, &count, &s.gpu));
++    vkGetPhysicalDeviceProperties(s.gpu, &s.props);
++    Trace("GPU %s, API %u.%u.%u", s.props.deviceName, VK_API_VERSION_MAJOR(s.props.apiVersion),
++          VK_API_VERSION_MINOR(s.props.apiVersion), VK_API_VERSION_PATCH(s.props.apiVersion));
++
++    VkQueueFamilyProperties families[8];
++    uint32_t familyCount = 8;
++    vkGetPhysicalDeviceQueueFamilyProperties(s.gpu, &familyCount, families);
++    for (uint32_t i = 0; i < familyCount; i++) {
++        if (families[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) {
++            s.queueFamily = i;
++            break;
++        }
++    }
++
++    VkPhysicalDeviceFeatures supported = {};
++    vkGetPhysicalDeviceFeatures(s.gpu, &supported);
++    VkPhysicalDeviceFeatures features = {};
++    features.depthClamp = supported.depthClamp;
++    s.depthClamp = supported.depthClamp;
++
++    std::vector<const char*> extensions;
++    uint32_t extCount = 0;
++    vkEnumerateDeviceExtensionProperties(s.gpu, nullptr, &extCount, nullptr);
++    std::vector<VkExtensionProperties> exts(extCount);
++    vkEnumerateDeviceExtensionProperties(s.gpu, nullptr, &extCount, exts.data());
++    for (auto& e : exts) {
++        if (strcmp(e.extensionName, VK_KHR_SAMPLER_MIRROR_CLAMP_TO_EDGE_EXTENSION_NAME) == 0) {
++            extensions.push_back(VK_KHR_SAMPLER_MIRROR_CLAMP_TO_EDGE_EXTENSION_NAME);
++            s.mirrorClamp = true;
++        }
++    }
++
++    float priority = 1.0f;
++    VkDeviceQueueCreateInfo qinfo = { VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO };
++    qinfo.queueFamilyIndex = s.queueFamily;
++    qinfo.queueCount = 1;
++    qinfo.pQueuePriorities = &priority;
++    VkDeviceCreateInfo dinfo = { VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO };
++    dinfo.queueCreateInfoCount = 1;
++    dinfo.pQueueCreateInfos = &qinfo;
++    dinfo.enabledExtensionCount = (uint32_t)extensions.size();
++    dinfo.ppEnabledExtensionNames = extensions.data();
++    dinfo.pEnabledFeatures = &features;
++    VK_CHECK(vkCreateDevice(s.gpu, &dinfo, nullptr, &s.device));
++#define GDX_VK_LOAD_D(name)                                                                       \
++    name = (PFN_##name)vkGetDeviceProcAddr(s.device, #name);                                      \
++    if (name == nullptr) {                                                                        \
++        Trace("missing device function %s", #name);                                               \
++    }
++    GDX_VK_DEVICE_FUNCS(GDX_VK_LOAD_D)
++#undef GDX_VK_LOAD_D
++    vkGetDeviceQueue(s.device, s.queueFamily, 0, &s.queue);
++    Trace("device ready: depth clamp %d, mirror clamp %d", s.depthClamp, s.mirrorClamp);
++
++    VmaVulkanFunctions vmaFuncs = {};
++    vmaFuncs.vkGetInstanceProcAddr = [](VkInstance instance, const char* name) {
++        return vk_icdGetInstanceProcAddr(instance, name);
++    };
++    vmaFuncs.vkGetDeviceProcAddr = vkGetDeviceProcAddr;
++    VmaAllocatorCreateInfo ainfo = {};
++    ainfo.vulkanApiVersion = VK_API_VERSION_1_1;
++    ainfo.physicalDevice = s.gpu;
++    ainfo.device = s.device;
++    ainfo.instance = s.instance;
++    ainfo.pVulkanFunctions = &vmaFuncs;
++    VK_CHECK(vmaCreateAllocator(&ainfo, &s.allocator));
++
++    // Render passes: load and store everything (Fast3D clears with ClearFramebuffer), colour in
++    // GENERAL throughout, and external dependencies covering attachment writes against later
++    // sampling, copies and attachment use.
++    for (int hasDepth = 0; hasDepth < 2; hasDepth++) {
++        VkAttachmentDescription att[2] = {};
++        att[0].format = kColorFormat;
++        att[0].samples = VK_SAMPLE_COUNT_1_BIT;
++        att[0].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
++        att[0].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
++        att[0].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
++        att[0].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
++        att[0].initialLayout = VK_IMAGE_LAYOUT_GENERAL;
++        att[0].finalLayout = VK_IMAGE_LAYOUT_GENERAL;
++        att[1] = att[0];
++        att[1].format = kDepthFormat;
++        att[1].initialLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
++        att[1].finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
++        VkAttachmentReference colorRef = { 0, VK_IMAGE_LAYOUT_GENERAL };
++        VkAttachmentReference depthRef = { 1, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL };
++        VkSubpassDescription sub = {};
++        sub.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
++        sub.colorAttachmentCount = 1;
++        sub.pColorAttachments = &colorRef;
++        sub.pDepthStencilAttachment = hasDepth ? &depthRef : nullptr;
++        const VkPipelineStageFlags stages =
++            VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
++            VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
++            VK_PIPELINE_STAGE_TRANSFER_BIT;
++        const VkAccessFlags writes = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
++                                     VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
++        const VkAccessFlags all = writes | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT |
++                                  VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_SHADER_READ_BIT |
++                                  VK_ACCESS_TRANSFER_READ_BIT;
++        VkSubpassDependency deps[2] = {};
++        deps[0] = { VK_SUBPASS_EXTERNAL, 0, stages, stages, writes, all, 0 };
++        deps[1] = { 0, VK_SUBPASS_EXTERNAL, stages, stages, writes, all, 0 };
++        VkRenderPassCreateInfo info = { VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO };
++        info.attachmentCount = hasDepth ? 2 : 1;
++        info.pAttachments = att;
++        info.subpassCount = 1;
++        info.pSubpasses = &sub;
++        info.dependencyCount = 2;
++        info.pDependencies = deps;
++        VK_CHECK(vkCreateRenderPass(s.device, &info, nullptr, &s.renderPass[hasDepth]));
++    }
++
++    VkDescriptorSetLayoutBinding bindings[SHADER_MAX_TEXTURES];
++    for (uint32_t i = 0; i < SHADER_MAX_TEXTURES; i++) {
++        bindings[i] = { i, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr };
++    }
++    VkDescriptorSetLayoutCreateInfo linfo = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
++    linfo.bindingCount = SHADER_MAX_TEXTURES;
++    linfo.pBindings = bindings;
++    VK_CHECK(vkCreateDescriptorSetLayout(s.device, &linfo, nullptr, &s.setLayout));
++    VkPushConstantRange range = { VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(PushConstants) };
++    VkPipelineLayoutCreateInfo plinfo = { VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
++    plinfo.setLayoutCount = 1;
++    plinfo.pSetLayouts = &s.setLayout;
++    plinfo.pushConstantRangeCount = 1;
++    plinfo.pPushConstantRanges = &range;
++    VK_CHECK(vkCreatePipelineLayout(s.device, &plinfo, nullptr, &s.pipelineLayout));
++    s.LoadPipelineCache();
++
++    for (auto& f : s.frames) {
++        VkCommandPoolCreateInfo pinfo = { VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO };
++        pinfo.queueFamilyIndex = s.queueFamily;
++        VK_CHECK(vkCreateCommandPool(s.device, &pinfo, nullptr, &f.pool));
++        VkCommandBuffer cbs[2];
++        VkCommandBufferAllocateInfo cinfo = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
++        cinfo.commandPool = f.pool;
++        cinfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
++        cinfo.commandBufferCount = 2;
++        VK_CHECK(vkAllocateCommandBuffers(s.device, &cinfo, cbs));
++        f.upload = cbs[0];
++        f.cmd = cbs[1];
++        VkFenceCreateInfo finfo = { VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
++        VK_CHECK(vkCreateFence(s.device, &finfo, nullptr, &f.fence));
++        f.vertices.usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT;
++        f.vertices.chunkSize = 8 << 20;
++        f.staging.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
++        f.staging.chunkSize = 16 << 20;
++    }
++
++    // VideoOut buffers: linear images in host-visible memory (GPU address = CPU address).
++    s.video = sceVideoOutOpen(0xFF, 0, 0, nullptr);
++    Trace("sceVideoOutOpen = %#x", (unsigned)s.video);
++    sceKernelCreateEqueue(&s.flipQueue, "gdx flip");
++    sceVideoOutAddFlipEvent(s.flipQueue, s.video, nullptr);
++    VkPhysicalDeviceMemoryProperties mem;
++    vkGetPhysicalDeviceMemoryProperties(s.gpu, &mem);
++    void* addresses[kSwapImages];
++    uint32_t pitch = kOutW;
++    for (uint32_t i = 0; i < kSwapImages; i++) {
++        SwapImage& img = s.swap[i];
++        VkImageCreateInfo info = { VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
++        info.imageType = VK_IMAGE_TYPE_2D;
++        info.format = kColorFormat;
++        info.extent = { kOutW, kOutH, 1 };
++        info.mipLevels = 1;
++        info.arrayLayers = 1;
++        info.samples = VK_SAMPLE_COUNT_1_BIT;
++        info.tiling = VK_IMAGE_TILING_LINEAR;
++        info.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
++                     VK_IMAGE_USAGE_TRANSFER_DST_BIT;
++        info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
++        VK_CHECK(vkCreateImage(s.device, &info, nullptr, &img.image));
++        VkMemoryRequirements req;
++        vkGetImageMemoryRequirements(s.device, img.image, &req);
++        uint32_t type = UINT32_MAX;
++        const VkMemoryPropertyFlags want = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
++                                           VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
++        for (uint32_t t = 0; t < mem.memoryTypeCount && type == UINT32_MAX; t++) {
++            if ((req.memoryTypeBits & (1u << t)) && (mem.memoryTypes[t].propertyFlags & want) == want) {
++                type = t;
++            }
++        }
++        VkMemoryAllocateInfo alloc = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
++        alloc.allocationSize = req.size + kVideoOutAlign;
++        alloc.memoryTypeIndex = type;
++        VK_CHECK(vkAllocateMemory(s.device, &alloc, nullptr, &img.memory));
++        uint8_t* base = nullptr;
++        VK_CHECK(vkMapMemory(s.device, img.memory, 0, VK_WHOLE_SIZE, 0, (void**)&base));
++        VkDeviceSize offset = ((uintptr_t)base + kVideoOutAlign - 1) / kVideoOutAlign * kVideoOutAlign - (uintptr_t)base;
++        offset = (offset + req.alignment - 1) / req.alignment * req.alignment;
++        VK_CHECK(vkBindImageMemory(s.device, img.image, img.memory, offset));
++        VkImageSubresource sr = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0 };
++        VkSubresourceLayout layout;
++        vkGetImageSubresourceLayout(s.device, img.image, &sr, &layout);
++        img.address = base + offset + layout.offset;
++        addresses[i] = img.address;
++        pitch = (uint32_t)(layout.rowPitch / 4);
++        VkImageViewCreateInfo vinfo = { VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
++        vinfo.image = img.image;
++        vinfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
++        vinfo.format = kColorFormat;
++        vinfo.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
++        VK_CHECK(vkCreateImageView(s.device, &vinfo, nullptr, &img.view));
++    }
++    OrbisVideoOutBufferAttribute attribute;
++    sceVideoOutSetBufferAttribute(&attribute, ORBIS_VIDEO_OUT_PIXEL_FORMAT_A8B8G8R8_SRGB,
++                                  ORBIS_VIDEO_OUT_TILING_MODE_LINEAR, 0, kOutW, kOutH, pitch);
++    s.bufferSet = sceVideoOutRegisterBuffers(s.video, 0, addresses, kSwapImages, &attribute);
++    Trace("sceVideoOutRegisterBuffers = %#x (pitch %u)", (unsigned)s.bufferSet, pitch);
++
++    // VkTex 0: 1x1 white, for sampler slots a draw does not use. Framebuffer 0: VideoOut.
++    s.textures.resize(1);
++    s.framebuffers.resize(1);
++    s.framebuffers[0].isSwap = true;
++    s.BeginFrame();
++    const uint8_t white[4] = { 255, 255, 255, 255 };
++    s.Upload(s.textures[0], white, 1, 1);
++    VkClearColorValue black = { { 0.0f, 0.0f, 0.0f, 1.0f } };
++    VkImageSubresourceRange all = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
++    for (auto& img : s.swap) {
++        s.Barrier(s.F().upload, img.image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED,
++                  VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0, VK_PIPELINE_STAGE_TRANSFER_BIT,
++                  VK_ACCESS_TRANSFER_WRITE_BIT);
++        vkCmdClearColorImage(s.F().upload, img.image, VK_IMAGE_LAYOUT_GENERAL, &black, 1, &all);
++    }
++    s.MemoryBarrier(s.F().upload, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
++                    VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
++    s.SubmitAndWait();
++    // UpdateFramebufferParameters(0, ...) creates framebuffer 0's depth buffer and VkFramebuffers.
++    UpdateFramebufferParameters(0, kOutW, kOutH, 1, false, true, true, false);
++
++    VkSamplerCreateInfo sinfo = { VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO };
++    sinfo.magFilter = sinfo.minFilter = VK_FILTER_LINEAR;
++    sinfo.addressModeU = sinfo.addressModeV = sinfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
++    sinfo.maxLod = VK_LOD_CLAMP_NONE;
++    VK_CHECK(vkCreateSampler(s.device, &sinfo, nullptr, &s.imguiSampler));
++    Trace("renderer ready");
++
++    // The GUI starts here rather than in the window backend (which the interpreter initialises
++    // first): ImGui's Vulkan backend needs this device.
++    GuiWindowInitData impl = {};
++    impl.Ps4.Width = kOutW;
++    impl.Ps4.Height = kOutH;
++    std::dynamic_pointer_cast<Fast3dGui>(Ship::Context::GetInstance()->GetWindow()->GetGui())->Init(impl);
++}
++
++void GfxRenderingAPIVulkan::OnResize() {
++}
++
++// ---- shaders ----
++
++void GfxRenderingAPIVulkan::UnloadShader(ShaderProgram* oldPrg) {
++}
++
++void GfxRenderingAPIVulkan::LoadShader(ShaderProgram* newPrg) {
++    mState->program = (ShaderProgramVk*)newPrg;
++}
++
++void GfxRenderingAPIVulkan::ClearShaderCache() {
++    VulkanState& s = *mState;
++    VkDevice dev = s.device;
++    for (auto& [key, pipeline] : s.pipelines) {
++        VkPipeline p = pipeline;
++        s.Retire([=] { vkDestroyPipeline(dev, p, nullptr); });
++    }
++    s.pipelines.clear();
++    for (auto& [key, prg] : s.programs) {
++        VkShaderModule vs = prg.vs, fs = prg.fs;
++        s.Retire([=] {
++            vkDestroyShaderModule(dev, vs, nullptr);
++            vkDestroyShaderModule(dev, fs, nullptr);
++        });
++    }
++    s.programs.clear();
++    s.program = nullptr;
++    s.boundPipeline = VK_NULL_HANDLE;
++}
++
++ShaderProgram* GfxRenderingAPIVulkan::CreateAndLoadNewShader(uint64_t shaderId0, uint64_t shaderId1) {
++    VulkanState& s = *mState;
++    CCFeatures cc;
++    gfx_cc_get_features(shaderId0, shaderId1, &cc);
++
++    const uint64_t t0 = sceKernelGetProcessTime();
++    auto templ = LoadShaderResource(ShaderTemplatePath(cc));
++    if (templ == nullptr) {
++        SPDLOG_ERROR("Failed to load the Fast3D shader template, missing gdiffuser.o2r?");
++        abort();
++    }
++    const GdxVulkanShaderText text =
++        GdxBuildVulkanShaders(cc, *static_cast<std::string*>(templ->GetRawPointer()),
++                              s.filterMode == FILTER_THREE_POINT, mSrgbMode, IncludeLoader);
++    const std::string& vsGlsl = text.vs;
++    const std::string& fsGlsl = text.fs;
++    const size_t numFloats = text.numFloats;
++    std::string error;
++    std::vector<uint32_t> vsSpv = CompileSpv(vsGlsl, EShLangVertex, &error);
++    if (vsSpv.empty()) {
++        SPDLOG_ERROR("Vulkan vertex shader {:016X}:{:016X} failed: {}\n{}", shaderId0, shaderId1, error, vsGlsl);
++        Trace("vertex shader compile failed: %s", error.c_str());
++        abort();
++    }
++    std::vector<uint32_t> fsSpv = CompileSpv(fsGlsl, EShLangFragment, &error);
++    if (fsSpv.empty()) {
++        SPDLOG_ERROR("Vulkan fragment shader {:016X}:{:016X} failed: {}\n{}", shaderId0, shaderId1, error, fsGlsl);
++        Trace("fragment shader compile failed: %s", error.c_str());
++        abort();
++    }
++
++    ShaderProgramVk& prg = s.programs[std::make_pair(shaderId0, shaderId1)];
++    prg.index = s.nextProgramIndex++;
++    VkShaderModuleCreateInfo minfo = { VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO };
++    minfo.codeSize = vsSpv.size() * 4;
++    minfo.pCode = vsSpv.data();
++    VK_CHECK(vkCreateShaderModule(s.device, &minfo, nullptr, &prg.vs));
++    minfo.codeSize = fsSpv.size() * 4;
++    minfo.pCode = fsSpv.data();
++    VK_CHECK(vkCreateShaderModule(s.device, &minfo, nullptr, &prg.fs));
++
++    // Same attribute order as the vertex template (and the OpenGL backend).
++    uint8_t cnt = 0;
++    prg.attribSizes[cnt++] = 4;
++    for (int i = 0; i < 2; i++) {
++        if (cc.usedTextures[i]) {
++            prg.attribSizes[cnt++] = 2;
++            for (int j = 0; j < 2; j++) {
++                if (cc.clamp[i][j]) {
++                    prg.attribSizes[cnt++] = 1;
++                }
++            }
++        }
++    }
++    if (cc.opt_fog) {
++        prg.attribSizes[cnt++] = 4;
++    }
++    if (cc.opt_grayscale) {
++        prg.attribSizes[cnt++] = 4;
++    }
++    for (int i = 0; i < cc.numInputs; i++) {
++        prg.attribSizes[cnt++] = cc.opt_alpha ? 4 : 3;
++    }
++    prg.numAttribs = cnt;
++    prg.numFloats = (uint8_t)numFloats;
++    prg.numInputs = cc.numInputs;
++    prg.usedTextures[0] = cc.usedTextures[0];
++    prg.usedTextures[1] = cc.usedTextures[1];
++    prg.usedTextures[2] = cc.used_masks[0];
++    prg.usedTextures[3] = cc.used_masks[1];
++    prg.usedTextures[4] = cc.used_blend[0];
++    prg.usedTextures[5] = cc.used_blend[1];
++    prg.blend = cc.opt_alpha;
++
++    static int sCount = 0;
++    if (++sCount <= 20 || sCount % 50 == 0) {
++        Trace("shader #%d %016llX:%016llX in %llu us", sCount, (unsigned long long)shaderId0,
++              (unsigned long long)shaderId1, (unsigned long long)(sceKernelGetProcessTime() - t0));
++    }
++    s.program = &prg;
++    return (ShaderProgram*)&prg;
++}
++
++ShaderProgram* GfxRenderingAPIVulkan::LookupShader(uint64_t shaderId0, uint64_t shaderId1) {
++    auto it = mState->programs.find(std::make_pair(shaderId0, shaderId1));
++    return it == mState->programs.end() ? nullptr : (ShaderProgram*)&it->second;
++}
++
++void GfxRenderingAPIVulkan::ShaderGetInfo(ShaderProgram* prg, uint8_t* numInputs, bool usedTextures[2]) {
++    ShaderProgramVk* p = (ShaderProgramVk*)prg;
++    *numInputs = p->numInputs;
++    usedTextures[0] = p->usedTextures[0];
++    usedTextures[1] = p->usedTextures[1];
++}
++
++// ---- textures ----
++
++uint32_t GfxRenderingAPIVulkan::NewTexture() {
++    mState->textures.emplace_back();
++    return (uint32_t)(mState->textures.size() - 1);
++}
++
++void GfxRenderingAPIVulkan::DeleteTexture(uint32_t texId) {
++    VulkanState& s = *mState;
++    if (texId == 0 || texId >= s.textures.size() || s.textures[texId].isFramebuffer) {
++        return;
++    }
++    s.DestroyTextureImage(s.textures[texId]);
++}
++
++void GfxRenderingAPIVulkan::SelectTexture(int tile, uint32_t textureId) {
++    mState->tile = tile;
++    mState->textureIds[tile] = textureId;
++}
++
++void GfxRenderingAPIVulkan::UploadTexture(const uint8_t* rgba32Buf, uint32_t width, uint32_t height) {
++    VulkanState& s = *mState;
++    if (width == 0 || height == 0) {
++        return;
++    }
++    const uint32_t id = s.textureIds[s.tile];
++    if (id == 0 || id >= s.textures.size()) {
++        return;
++    }
++    s.Upload(s.textures[id], rgba32Buf, width, height);
++}
++
++void GfxRenderingAPIVulkan::SetSamplerParameters(int sampler, bool linear_filter, uint32_t cms, uint32_t cmt) {
++    VulkanState& s = *mState;
++    const uint32_t id = s.textureIds[sampler];
++    if (id >= s.textures.size()) {
++        return;
++    }
++    VkTex& t = s.textures[id];
++    t.linear = linear_filter;
++    t.cms = cms;
++    t.cmt = cmt;
++    t.filtering = !linear_filter ? FILTER_LINEAR : FILTER_THREE_POINT; // OpenGL backend semantics
++}
++
++void GfxRenderingAPIVulkan::SetTextureFilter(FilteringMode mode) {
++    mState->filterMode = mode;
++    gfx_texture_cache_clear();
++}
++
++FilteringMode GfxRenderingAPIVulkan::GetTextureFilter() {
++    return mState->filterMode;
++}
++
++void GfxRenderingAPIVulkan::SetSrgbMode() {
++    mSrgbMode = true;
++}
++
++ImTextureID GfxRenderingAPIVulkan::GetTextureById(int id) {
++    VulkanState& s = *mState;
++    VkTex& t = s.Tex((uint32_t)id);
++    if (t.imgui == VK_NULL_HANDLE) {
++        t.imgui = ImGui_ImplVulkan_AddTexture(s.imguiSampler, t.view, t.layout);
++    }
++    return (ImTextureID)t.imgui;
++}
++
++// ---- state ----
++
++void GfxRenderingAPIVulkan::SetDepthTestAndMask(bool depth_test, bool z_upd) {
++    mCurrentDepthTest = depth_test;
++    mCurrentDepthMask = z_upd;
++}
++
++void GfxRenderingAPIVulkan::SetZmodeDecal(bool decal) {
++    mCurrentZmodeDecal = decal;
++}
++
++void GfxRenderingAPIVulkan::SetCurrentPrimDepth(float depth) {
++    mCurrentPrimDepth = depth;
++}
++
++void GfxRenderingAPIVulkan::SetCurrentAlphaCompareThreshold(float threshold) {
++    mCurrentAlphaCompareThreshold = threshold;
++}
++
++void GfxRenderingAPIVulkan::SetViewport(int x, int y, int width, int height) {
++    VulkanState& s = *mState;
++    // OpenGL-style rectangle (origin bottom-left) -> a flipped Vulkan viewport over a top-down
++    // render target: y runs from the rectangle's bottom edge upwards.
++    s.viewport.x = (float)x;
++    s.viewport.y = (float)((int)s.renderTargetHeight - y);
++    s.viewport.width = (float)width;
++    s.viewport.height = -(float)height;
++    s.viewport.minDepth = 0.0f;
++    s.viewport.maxDepth = 1.0f;
++    s.viewportDirty = true;
++}
++
++void GfxRenderingAPIVulkan::SetScissor(int x, int y, int width, int height) {
++    VulkanState& s = *mState;
++    int top = (int)s.renderTargetHeight - y - height;
++    int left = x;
++    int right = x + width;
++    int bottom = top + height;
++    left = std::clamp(left, 0, (int)s.renderTargetWidth);
++    right = std::clamp(right, 0, (int)s.renderTargetWidth);
++    top = std::clamp(top, 0, (int)s.renderTargetHeight);
++    bottom = std::clamp(bottom, 0, (int)s.renderTargetHeight);
++    s.scissor.offset = { left, top };
++    s.scissor.extent = { (uint32_t)std::max(right - left, 0), (uint32_t)std::max(bottom - top, 0) };
++    s.scissorDirty = true;
++}
++
++void GfxRenderingAPIVulkan::SetUseAlpha(bool useAlpha) {
++    // Part of the pipeline (from the shader's opt_alpha), as in the D3D11 backend.
++}
++
++void GfxRenderingAPIVulkan::DrawTriangles(float buf_vbo[], size_t buf_vbo_len, size_t buf_vbo_num_tris) {
++    VulkanState& s = *mState;
++    ShaderProgramVk* prg = s.program;
++    if (prg == nullptr || buf_vbo_num_tris == 0) {
++        return;
++    }
++    s.EnsureRenderPass();
++    if (!s.inRenderPass) {
++        return;
++    }
++    Framebuffer& fb = s.framebuffers[s.currentFb];
++    VkCommandBuffer cb = s.F().cmd;
++
++    VkPipeline pipeline = s.Pipeline(prg, mCurrentDepthTest, mCurrentDepthMask, mCurrentZmodeDecal, fb.hasDepth);
++    if (pipeline != s.boundPipeline) {
++        vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
++        s.boundPipeline = pipeline;
++        s.boundSet = VK_NULL_HANDLE;
++    }
++    if (s.viewportDirty) {
++        vkCmdSetViewport(cb, 0, 1, &s.viewport);
++        s.viewportDirty = false;
++    }
++    if (s.scissorDirty) {
++        vkCmdSetScissor(cb, 0, 1, &s.scissor);
++        s.scissorDirty = false;
++    }
++
++    // Decal depth bias, as the D3D11 backend computes it (slope-scaled only).
++    float bias = 0.0f;
++    if (mCurrentZmodeDecal) {
++        bias = -2.0f;
++        switch (Ship::Context::GetInstance()->GetConsoleVariables()->GetInteger(CVAR_Z_FIGHTING_MODE, 0)) {
++            case 1:
++                bias = -1.0f * (float)s.renderTargetHeight / 120;
++                break;
++            case 2:
++                bias = -1.0f * (float)s.renderTargetHeight / 100;
++                break;
++            default:
++                break;
++        }
++    }
++    if (s.depthBiasDirty || bias != s.depthBias) {
++        vkCmdSetDepthBias(cb, 0.0f, 0.0f, bias);
++        s.depthBias = bias;
++        s.depthBiasDirty = false;
++    }
++
++    // Textures: binding = texture unit. Unused units get texture 0.
++    SetKey key;
++    VkDescriptorImageInfo images[SHADER_MAX_TEXTURES];
++    PushConstants pc = {};
++    for (int i = 0; i < SHADER_MAX_TEXTURES; i++) {
++        VkTex* tp = prg->usedTextures[i] ? &s.Tex(s.textureIds[i]) : &s.textures[0];
++        if (i == 1 && prg->usedTextures[1] && tp == &s.textures[0] && prg->usedTextures[0]) {
++            // TEXEL1 with nothing loaded on its tile: in one-cycle mode the N64 reads TEXEL1 as
++            // (the next pixel's) TEXEL0, so unit 0's texture is the faithful stand-in, not white.
++            tp = &s.Tex(s.textureIds[0]);
++        }
++        VkTex& t = *tp;
++        t.lastUse = s.serial;
++        const bool linearHw = t.linear && s.filterMode == FILTER_LINEAR;
++        images[i].sampler = s.Sampler(linearHw, t.cms, t.cmt);
++        images[i].imageView = t.view;
++        images[i].imageLayout = t.layout;
++        key.v[i * 2] = (uint64_t)(uintptr_t)images[i].imageView;
++        key.v[i * 2 + 1] = (uint64_t)(uintptr_t)images[i].sampler;
++        if (i < 2) {
++            pc.texture_width[i] = (int32_t)t.width;
++            pc.texture_height[i] = (int32_t)t.height;
++            pc.texture_filtering[i] = t.filtering;
++        }
++    }
++    VkDescriptorSet set;
++    auto it = s.setCache.find(key);
++    if (it != s.setCache.end()) {
++        set = it->second;
++    } else {
++        set = s.AllocateSet();
++        VkWriteDescriptorSet writes[SHADER_MAX_TEXTURES];
++        for (uint32_t i = 0; i < SHADER_MAX_TEXTURES; i++) {
++            writes[i] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
++            writes[i].dstSet = set;
++            writes[i].dstBinding = i;
++            writes[i].descriptorCount = 1;
++            writes[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
++            writes[i].pImageInfo = &images[i];
++        }
++        vkUpdateDescriptorSets(s.device, SHADER_MAX_TEXTURES, writes, 0, nullptr);
++        s.setCache.emplace(key, set);
++    }
++    if (set != s.boundSet) {
++        vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, s.pipelineLayout, 0, 1, &set, 0, nullptr);
++        s.boundSet = set;
++    }
++
++    pc.frame_count = (int32_t)s.frameCount;
++    pc.noise_scale = s.noiseScale;
++    pc.prim_depth = mCurrentPrimDepth;
++    pc.alpha_compare_threshold = mCurrentAlphaCompareThreshold;
++    vkCmdPushConstants(cb, s.pipelineLayout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(pc), &pc);
++
++    VkBuffer buffer;
++    VkDeviceSize offset;
++    uint8_t* dst = s.RingAlloc(s.F().vertices, buf_vbo_len * sizeof(float), 16, &buffer, &offset);
++    memcpy(dst, buf_vbo, buf_vbo_len * sizeof(float));
++    vkCmdBindVertexBuffers(cb, 0, 1, &buffer, &offset);
++    vkCmdDraw(cb, (uint32_t)(buf_vbo_num_tris * 3), 1, 0, 0);
++}
++
++// ---- frames ----
++
++void GfxRenderingAPIVulkan::StartFrame() {
++    mState->BeginFrame();
++    mState->frameCount++;
++}
++
++void GfxRenderingAPIVulkan::EndFrame() {
++}
++
++void GfxRenderingAPIVulkan::FinishRender() {
++    mState->Present();
++}
++
++// ---- framebuffers ----
++
++int GfxRenderingAPIVulkan::CreateFramebuffer() {
++    VulkanState& s = *mState;
++    const uint32_t tex = NewTexture();
++    s.textures[tex].isFramebuffer = true;
++    s.textures[tex].layout = VK_IMAGE_LAYOUT_GENERAL;
++    s.textures[tex].linear = true;
++    s.textures[tex].cms = s.textures[tex].cmt = G_TX_WRAP;
++    Framebuffer fb;
++    fb.colorTex = tex;
++    s.framebuffers.push_back(fb);
++    return (int)s.framebuffers.size() - 1;
++}
++
++void GfxRenderingAPIVulkan::UpdateFramebufferParameters(int fb_id, uint32_t width, uint32_t height,
++                                                        uint32_t msaa_level, bool opengl_invertY, bool render_target,
++                                                        bool has_depth_buffer, bool can_extract_depth,
++                                                        GdxFramebufferFormat format) {
++    VulkanState& s = *mState;
++    if (fb_id < 0 || fb_id >= (int)s.framebuffers.size()) {
++        return;
++    }
++    Framebuffer& fb = s.framebuffers[fb_id];
++    if (fb.isSwap) {
++        // Framebuffer 0 is the VideoOut output: fixed size, always with a depth buffer (ImGui's
++        // pipeline is built for the render pass with depth).
++        width = kOutW;
++        height = kOutH;
++        has_depth_buffer = true;
++    }
++    width = std::max(width, 1u);
++    height = std::max(height, 1u);
++    const bool hasHandles = fb.fb[0] != VK_NULL_HANDLE;
++    if (hasHandles && fb.width == width && fb.height == height && fb.hasDepth == has_depth_buffer) {
++        return;
++    }
++    s.BeginFrame();
++    if (s.inRenderPass && s.renderPassFb == fb_id) {
++        s.EndRenderPass();
++    }
++    s.DestroyFramebufferObjects(fb);
++    fb.width = width;
++    fb.height = height;
++    fb.hasDepth = has_depth_buffer;
++    if (fb.hasDepth) {
++        s.CreateDepth(fb);
++    }
++    if (fb.isSwap) {
++        for (uint32_t i = 0; i < kSwapImages; i++) {
++            s.CreateVkFramebuffer(fb, i, s.swap[i].view);
++        }
++    } else {
++        VkTex& t = s.textures[fb.colorTex];
++        s.DestroyTextureImage(t);
++        s.CreateImage(width, height, kColorFormat,
++                      VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
++                          VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
++                      VK_IMAGE_ASPECT_COLOR_BIT, &t.image, &t.alloc, &t.view);
++        t.width = width;
++        t.height = height;
++        t.layout = VK_IMAGE_LAYOUT_GENERAL;
++        // Start out black and opaque, like a fresh OpenGL texture that is cleared before use.
++        VkClearColorValue black = { { 0.0f, 0.0f, 0.0f, 1.0f } };
++        VkImageSubresourceRange all = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
++        s.Barrier(s.F().upload, t.image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED,
++                  VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0, VK_PIPELINE_STAGE_TRANSFER_BIT,
++                  VK_ACCESS_TRANSFER_WRITE_BIT);
++        vkCmdClearColorImage(s.F().upload, t.image, VK_IMAGE_LAYOUT_GENERAL, &black, 1, &all);
++        s.MemoryBarrier(s.F().upload, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
++                        VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
++        s.CreateVkFramebuffer(fb, 0, t.view);
++    }
++    if (s.currentFb == fb_id) {
++        s.renderTargetWidth = width;
++        s.renderTargetHeight = height;
++    }
++}
++
++void GfxRenderingAPIVulkan::StartDrawToFramebuffer(int fbId, float noiseScale) {
++    VulkanState& s = *mState;
++    if (fbId < 0 || fbId >= (int)s.framebuffers.size()) {
++        return;
++    }
++    s.currentFb = fbId;
++    s.renderTargetWidth = s.framebuffers[fbId].width;
++    s.renderTargetHeight = s.framebuffers[fbId].height;
++    if (noiseScale != 0.0f) {
++        s.noiseScale = 1.0f / noiseScale;
++    }
++}
++
++void GfxRenderingAPIVulkan::ClearFramebuffer(bool color, bool depth) {
++    VulkanState& s = *mState;
++    s.EnsureRenderPass();
++    if (!s.inRenderPass) {
++        return;
++    }
++    Framebuffer& fb = s.framebuffers[s.currentFb];
++    VkClearAttachment clears[2];
++    uint32_t n = 0;
++    if (color) {
++        clears[n] = {};
++        clears[n].aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
++        clears[n].colorAttachment = 0;
++        clears[n].clearValue.color = { { 0.0f, 0.0f, 0.0f, 1.0f } };
++        n++;
++    }
++    if (depth && fb.hasDepth) {
++        clears[n] = {};
++        clears[n].aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
++        clears[n].clearValue.depthStencil = { 1.0f, 0 };
++        n++;
++    }
++    if (n == 0) {
++        return;
++    }
++    VkClearRect rect = { { { 0, 0 }, { fb.width, fb.height } }, 0, 1 };
++    vkCmdClearAttachments(s.F().cmd, n, clears, 1, &rect);
++}
++
++void GfxRenderingAPIVulkan::ClearDepthRegion(int x, int y, int w, int h) {
++    VulkanState& s = *mState;
++    s.EnsureRenderPass();
++    if (!s.inRenderPass) {
++        return;
++    }
++    Framebuffer& fb = s.framebuffers[s.currentFb];
++    if (!fb.hasDepth) {
++        return;
++    }
++    int top = (int)fb.height - y - h;
++    int left = std::clamp(x, 0, (int)fb.width);
++    int right = std::clamp(x + w, 0, (int)fb.width);
++    int bottom = std::clamp(top + h, 0, (int)fb.height);
++    top = std::clamp(top, 0, (int)fb.height);
++    if (right <= left || bottom <= top) {
++        return;
++    }
++    VkClearAttachment clear = {};
++    clear.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
++    clear.clearValue.depthStencil = { 1.0f, 0 };
++    VkClearRect rect = { { { left, top }, { (uint32_t)(right - left), (uint32_t)(bottom - top) } }, 0, 1 };
++    vkCmdClearAttachments(s.F().cmd, 1, &clear, 1, &rect);
++}
++
++void GfxRenderingAPIVulkan::CopyFramebuffer(int fbDstId, int fbSrcId, int srcX0, int srcY0, int srcX1, int srcY1,
++                                            int dstX0, int dstY0, int dstX1, int dstY1) {
++    VulkanState& s = *mState;
++    if (fbSrcId < 0 || fbDstId < 0 || fbSrcId >= (int)s.framebuffers.size() ||
++        fbDstId >= (int)s.framebuffers.size() || fbSrcId == fbDstId) {
++        return;
++    }
++    s.BeginFrame();
++    s.EndRenderPass();
++    Framebuffer& src = s.framebuffers[fbSrcId];
++    Framebuffer& dst = s.framebuffers[fbDstId];
++    VkImage srcImage = s.ColorImage(fbSrcId);
++    VkImage dstImage = s.ColorImage(fbDstId);
++    if (srcImage == VK_NULL_HANDLE || dstImage == VK_NULL_HANDLE) {
++        return;
++    }
++    VkImageCopy region = {};
++    region.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
++    region.dstSubresource = region.srcSubresource;
++    if (src.width == dst.width && src.height == dst.height) {
++        region.extent = { src.width, src.height, 1 };
++    } else {
++        if (srcY1 > (int)src.height || srcX1 > (int)src.width || srcX0 < 0 || srcY0 < 0 || dstY1 > (int)dst.height ||
++            dstX1 > (int)dst.width || dstX0 < 0 || dstY0 < 0) {
++            return; // same rule as the D3D11 backend: out-of-range copies are skipped
++        }
++        const uint32_t w = (uint32_t)std::min(srcX1 - srcX0, (int)dst.width - dstX0);
++        const uint32_t h = (uint32_t)std::min(srcY1 - srcY0, (int)dst.height - dstY0);
++        if ((int)w <= 0 || (int)h <= 0) {
++            return;
++        }
++        region.srcOffset = { srcX0, srcY0, 0 };
++        region.dstOffset = { dstX0, dstY0, 0 };
++        region.extent = { w, h, 1 };
++    }
++    VkCommandBuffer cb = s.F().cmd;
++    s.MemoryBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
++                    VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
++                    VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
++    vkCmdCopyImage(cb, srcImage, VK_IMAGE_LAYOUT_GENERAL, dstImage, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
++    s.MemoryBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
++                    VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
++}
++
++void GfxRenderingAPIVulkan::ResolveMSAAColorBuffer(int fbIdTarget, int fbIdSrc) {
++    // No MSAA on this backend (UpdateFramebufferParameters ignores msaa_level): a plain copy.
++    VulkanState& s = *mState;
++    if (fbIdTarget < 0 || fbIdSrc < 0 || fbIdTarget >= (int)s.framebuffers.size() ||
++        fbIdSrc >= (int)s.framebuffers.size() || fbIdTarget == fbIdSrc) {
++        return;
++    }
++    Framebuffer& src = s.framebuffers[fbIdSrc];
++    Framebuffer& dst = s.framebuffers[fbIdTarget];
++    if (src.width == dst.width && src.height == dst.height) {
++        CopyFramebuffer(fbIdTarget, fbIdSrc, 0, 0, src.width, src.height, 0, 0, dst.width, dst.height);
++        return;
++    }
++    s.BeginFrame();
++    s.EndRenderPass();
++    VkImageBlit blit = {};
++    blit.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
++    blit.dstSubresource = blit.srcSubresource;
++    blit.srcOffsets[1] = { (int32_t)src.width, (int32_t)src.height, 1 };
++    blit.dstOffsets[1] = { (int32_t)dst.width, (int32_t)dst.height, 1 };
++    VkCommandBuffer cb = s.F().cmd;
++    s.MemoryBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
++                    VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
++                    VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
++    vkCmdBlitImage(cb, s.ColorImage(fbIdSrc), VK_IMAGE_LAYOUT_GENERAL, s.ColorImage(fbIdTarget),
++                   VK_IMAGE_LAYOUT_GENERAL, 1, &blit, VK_FILTER_LINEAR);
++    s.MemoryBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
++                    VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
++}
++
++// ------------------------------------------------------------------------------------------------
++// FSR 1.0: AMD FidelityFX Super Resolution 1 (MIT), EASU + RCAS, ported to plain GLSL fragment
++// passes. The game renders at gInternalResolution; EASU scales that frame to the output size and
++// RCAS sharpens it, and ImGui draws the result 1:1 instead of stretching the small frame bilinearly.
++// FSR 2/3 need per-pixel motion vectors, which an N64 renderer never produces, so the spatial
++// FSR 1 is the one that applies here.
++// ------------------------------------------------------------------------------------------------
++namespace {
++
++const char* kFsrVs = R"(#version 450
++layout(location = 0) out vec2 vUv;
++void main() {
++    vec2 p = vec2((gl_VertexIndex << 1) & 2, gl_VertexIndex & 2);
++    vUv = p;
++    gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);
++}
++)";
++
++// Same 40-byte push block as the N64 shaders: texture_width/height[0] = source, [1] = output,
++// noise_scale = RCAS sharpness in stops (0 = sharpest).
++#define FSR_COMMON                                                                                \
++    "#version 450\n"                                                                              \
++    "layout(set = 0, binding = 0) uniform sampler2D uTex;\n"                                      \
++    "layout(push_constant) uniform P { int frame_count; float sharpness; float prim_depth;\n"     \
++    "    float act; int texture_width[2]; int texture_height[2]; int texture_filtering[2]; };\n"  \
++    "layout(location = 0) in vec2 vUv;\n"                                                         \
++    "layout(location = 0) out vec4 oColor;\n"                                                     \
++    "float Luma(vec3 c) { return c.b * 0.5 + (c.r * 0.5 + c.g); }\n"
++
++const char* kFsrEasu = FSR_COMMON R"(
++ivec2 gSize;
++vec3 T(ivec2 p) { return texelFetch(uTex, clamp(p, ivec2(0), gSize - 1), 0).rgb; }
++
++void EasuSet(inout vec2 dir, inout float len, float w, float lA, float lB, float lC, float lD, float lE) {
++    float lenX = max(abs(lD - lC), abs(lC - lB));
++    float dirX = lD - lB;
++    dir.x += dirX * w;
++    lenX = clamp(abs(dirX) / max(lenX, 1.0 / 65536.0), 0.0, 1.0);
++    lenX *= lenX;
++    len += lenX * w;
++    float lenY = max(abs(lE - lC), abs(lC - lA));
++    float dirY = lE - lA;
++    dir.y += dirY * w;
++    lenY = clamp(abs(dirY) / max(lenY, 1.0 / 65536.0), 0.0, 1.0);
++    lenY *= lenY;
++    len += lenY * w;
++}
++
++void EasuTap(inout vec3 aC, inout float aW, vec2 off, vec2 dir, vec2 len, float lob, float clp, vec3 c) {
++    vec2 v = vec2(off.x * dir.x + off.y * dir.y, off.x * -dir.y + off.y * dir.x) * len;
++    float d2 = min(v.x * v.x + v.y * v.y, clp);
++    float wB = 2.0 / 5.0 * d2 - 1.0;
++    float wA = lob * d2 - 1.0;
++    wB *= wB;
++    wA *= wA;
++    wB = 25.0 / 16.0 * wB - (25.0 / 16.0 - 1.0);
++    float w = wB * wA;
++    aC += c * w;
++    aW += w;
++}
++
++void main() {
++    gSize = textureSize(uTex, 0);
++    vec2 inSize = vec2(gSize);
++    vec2 outSize = vec2(texture_width[1], texture_height[1]);
++    vec2 pp = (floor(gl_FragCoord.xy) + 0.5) * (inSize / outSize) - 0.5;
++    vec2 fpf = floor(pp);
++    pp -= fpf;
++    ivec2 f = ivec2(fpf);
++    //    b c
++    //  e f g h
++    //  i j k l
++    //    n o
++    vec3 bC = T(f + ivec2(0, -1)), cC = T(f + ivec2(1, -1));
++    vec3 eC = T(f + ivec2(-1, 0)), fC = T(f), gC = T(f + ivec2(1, 0)), hC = T(f + ivec2(2, 0));
++    vec3 iC = T(f + ivec2(-1, 1)), jC = T(f + ivec2(0, 1)), kC = T(f + ivec2(1, 1)), lC = T(f + ivec2(2, 1));
++    vec3 nC = T(f + ivec2(0, 2)), oC = T(f + ivec2(1, 2));
++    float bL = Luma(bC), cL = Luma(cC), eL = Luma(eC), fL = Luma(fC), gL = Luma(gC), hL = Luma(hC);
++    float iL = Luma(iC), jL = Luma(jC), kL = Luma(kC), lL = Luma(lC), nL = Luma(nC), oL = Luma(oC);
++    vec2 dir = vec2(0.0);
++    float len = 0.0;
++    EasuSet(dir, len, (1.0 - pp.x) * (1.0 - pp.y), bL, eL, fL, gL, jL);
++    EasuSet(dir, len, pp.x * (1.0 - pp.y), cL, fL, gL, hL, kL);
++    EasuSet(dir, len, (1.0 - pp.x) * pp.y, fL, iL, jL, kL, nL);
++    EasuSet(dir, len, pp.x * pp.y, gL, jL, kL, lL, oL);
++    vec2 dir2 = dir * dir;
++    float dirR = dir2.x + dir2.y;
++    bool zro = dirR < 1.0 / 32768.0;
++    dirR = zro ? 1.0 : inversesqrt(dirR);
++    dir.x = zro ? 1.0 : dir.x;
++    dir *= dirR;
++    len = len * 0.5;
++    len *= len;
++    float stretch = (dir.x * dir.x + dir.y * dir.y) / max(abs(dir.x), abs(dir.y));
++    vec2 len2 = vec2(1.0 + (stretch - 1.0) * len, 1.0 - 0.5 * len);
++    float lob = 0.5 + ((1.0 / 4.0 - 0.04) - 0.5) * len;
++    float clp = 1.0 / lob;
++    vec3 min4 = min(min(fC, gC), min(jC, kC));
++    vec3 max4 = max(max(fC, gC), max(jC, kC));
++    vec3 aC = vec3(0.0);
++    float aW = 0.0;
++    EasuTap(aC, aW, vec2(0.0, -1.0) - pp, dir, len2, lob, clp, bC);
++    EasuTap(aC, aW, vec2(1.0, -1.0) - pp, dir, len2, lob, clp, cC);
++    EasuTap(aC, aW, vec2(-1.0, 1.0) - pp, dir, len2, lob, clp, iC);
++    EasuTap(aC, aW, vec2(0.0, 1.0) - pp, dir, len2, lob, clp, jC);
++    EasuTap(aC, aW, vec2(0.0, 0.0) - pp, dir, len2, lob, clp, fC);
++    EasuTap(aC, aW, vec2(-1.0, 0.0) - pp, dir, len2, lob, clp, eC);
++    EasuTap(aC, aW, vec2(1.0, 1.0) - pp, dir, len2, lob, clp, kC);
++    EasuTap(aC, aW, vec2(2.0, 1.0) - pp, dir, len2, lob, clp, lC);
++    EasuTap(aC, aW, vec2(2.0, 0.0) - pp, dir, len2, lob, clp, hC);
++    EasuTap(aC, aW, vec2(1.0, 0.0) - pp, dir, len2, lob, clp, gC);
++    EasuTap(aC, aW, vec2(1.0, 2.0) - pp, dir, len2, lob, clp, oC);
++    EasuTap(aC, aW, vec2(0.0, 2.0) - pp, dir, len2, lob, clp, nC);
++    oColor = vec4(min(max4, max(min4, aC / aW)), 1.0);
++}
++)";
++
++const char* kFsrRcas = FSR_COMMON R"(
++void main() {
++    ivec2 sz = textureSize(uTex, 0);
++    ivec2 p = ivec2(gl_FragCoord.xy);
++    vec3 b = texelFetch(uTex, clamp(p + ivec2(0, -1), ivec2(0), sz - 1), 0).rgb;
++    vec3 d = texelFetch(uTex, clamp(p + ivec2(-1, 0), ivec2(0), sz - 1), 0).rgb;
++    vec3 e = texelFetch(uTex, clamp(p, ivec2(0), sz - 1), 0).rgb;
++    vec3 f = texelFetch(uTex, clamp(p + ivec2(1, 0), ivec2(0), sz - 1), 0).rgb;
++    vec3 h = texelFetch(uTex, clamp(p + ivec2(0, 1), ivec2(0), sz - 1), 0).rgb;
++    float bL = Luma(b), dL = Luma(d), eL = Luma(e), fL = Luma(f), hL = Luma(h);
++    // noise detection: back off on single-pixel noise
++    float nz = 0.25 * (bL + dL + fL + hL) - eL;
++    float range = max(max(max(bL, dL), max(fL, hL)), eL) - min(min(min(bL, dL), min(fL, hL)), eL);
++    nz = clamp(abs(nz) / max(range, 1.0 / 65536.0), 0.0, 1.0);
++    nz = -0.5 * nz + 1.0;
++    vec3 mn4 = min(min(b, d), min(f, h));
++    vec3 mx4 = max(max(b, d), max(f, h));
++    vec3 hitMin = mn4 / max(4.0 * mx4, vec3(1.0 / 65536.0));
++    vec3 hitMax = (1.0 - mx4) / min(4.0 * mn4 - 4.0, vec3(-1.0 / 65536.0));
++    vec3 lobeRGB = max(-hitMin, hitMax);
++    float lobe = max(-0.1875, min(max(lobeRGB.r, max(lobeRGB.g, lobeRGB.b)), 0.0)) * exp2(-sharpness);
++    lobe *= nz;
++    vec3 c = (lobe * (b + d + f + h) + e) / (4.0 * lobe + 1.0);
++    oColor = vec4(c, 1.0);
++}
++)";
++
++bool FsrPipelines(VulkanState& s) {
++    if (s.fsrPipe[0] != VK_NULL_HANDLE) {
++        return true;
++    }
++    if (s.fsrFailed) {
++        return false;
++    }
++    const char* sources[3] = { kFsrVs, kFsrEasu, kFsrRcas };
++    const EShLanguage stages[3] = { EShLangVertex, EShLangFragment, EShLangFragment };
++    for (int i = 0; i < 3; i++) {
++        std::string err;
++        std::vector<uint32_t> spv = CompileSpv(sources[i], stages[i], &err);
++        if (spv.empty()) {
++            Trace("FSR shader %d failed: %s", i, err.c_str());
++            s.fsrFailed = true;
++            return false;
++        }
++        VkShaderModuleCreateInfo minfo = { VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO };
++        minfo.codeSize = spv.size() * 4;
++        minfo.pCode = spv.data();
++        VK_CHECK(vkCreateShaderModule(s.device, &minfo, nullptr, &s.fsrModules[i]));
++    }
++    for (int pass = 0; pass < 2; pass++) {
++        VkPipelineShaderStageCreateInfo st[2] = { { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO },
++                                                  { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO } };
++        st[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
++        st[0].module = s.fsrModules[0];
++        st[0].pName = "main";
++        st[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
++        st[1].module = s.fsrModules[1 + pass];
++        st[1].pName = "main";
++        VkPipelineVertexInputStateCreateInfo vi = { VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO };
++        VkPipelineInputAssemblyStateCreateInfo ia = { VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO };
++        ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
++        VkPipelineViewportStateCreateInfo vp = { VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO };
++        vp.viewportCount = 1;
++        vp.scissorCount = 1;
++        VkPipelineRasterizationStateCreateInfo rs = { VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO };
++        rs.polygonMode = VK_POLYGON_MODE_FILL;
++        rs.cullMode = VK_CULL_MODE_NONE;
++        rs.lineWidth = 1.0f;
++        VkPipelineMultisampleStateCreateInfo ms = { VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO };
++        ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
++        VkPipelineDepthStencilStateCreateInfo ds = { VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO };
++        VkPipelineColorBlendAttachmentState blend = {};
++        blend.colorWriteMask = 0xF;
++        VkPipelineColorBlendStateCreateInfo cb = { VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO };
++        cb.attachmentCount = 1;
++        cb.pAttachments = &blend;
++        VkDynamicState dynamic[2] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
++        VkPipelineDynamicStateCreateInfo dyn = { VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO };
++        dyn.dynamicStateCount = 2;
++        dyn.pDynamicStates = dynamic;
++        VkGraphicsPipelineCreateInfo info = { VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO };
++        info.stageCount = 2;
++        info.pStages = st;
++        info.pVertexInputState = &vi;
++        info.pInputAssemblyState = &ia;
++        info.pViewportState = &vp;
++        info.pRasterizationState = &rs;
++        info.pMultisampleState = &ms;
++        info.pDepthStencilState = &ds;
++        info.pColorBlendState = &cb;
++        info.pDynamicState = &dyn;
++        info.layout = s.pipelineLayout;
++        info.renderPass = s.renderPass[0]; // colour-only offscreen targets
++        VK_CHECK(vkCreateGraphicsPipelines(s.device, s.pipelineCache, 1, &info, nullptr, &s.fsrPipe[pass]));
++    }
++    Trace("FSR 1.0 pipelines ready");
++    return true;
++}
++
++// One full-screen pass: src framebuffer's colour -> dst framebuffer.
++void FsrPass(VulkanState& s, int pass, int srcFb, int dstFb, uint32_t outW, uint32_t outH, float sharpness) {
++    s.EndRenderPass();
++    // the source was just rendered (colour attachment) and is now sampled
++    s.MemoryBarrier(s.F().cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
++                    VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
++    s.currentFb = dstFb;
++    s.EnsureRenderPass();
++    if (!s.inRenderPass) {
++        return;
++    }
++    VkCommandBuffer cb = s.F().cmd;
++    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, s.fsrPipe[pass]);
++    VkTex& src = s.textures[s.framebuffers[srcFb].colorTex];
++    VkDescriptorImageInfo images[SHADER_MAX_TEXTURES];
++    for (int i = 0; i < SHADER_MAX_TEXTURES; i++) {
++        VkTex& t = i == 0 ? src : s.textures[0];
++        images[i].sampler = s.Sampler(true, G_TX_CLAMP, G_TX_CLAMP);
++        images[i].imageView = t.view;
++        images[i].imageLayout = i == 0 ? VK_IMAGE_LAYOUT_GENERAL : t.layout;
++    }
++    VkDescriptorSet set = s.AllocateSet();
++    VkWriteDescriptorSet writes[SHADER_MAX_TEXTURES];
++    for (uint32_t i = 0; i < SHADER_MAX_TEXTURES; i++) {
++        writes[i] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
++        writes[i].dstSet = set;
++        writes[i].dstBinding = i;
++        writes[i].descriptorCount = 1;
++        writes[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
++        writes[i].pImageInfo = &images[i];
++    }
++    vkUpdateDescriptorSets(s.device, SHADER_MAX_TEXTURES, writes, 0, nullptr);
++    vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, s.pipelineLayout, 0, 1, &set, 0, nullptr);
++    PushConstants pc = {};
++    pc.noise_scale = sharpness;
++    pc.texture_width[0] = (int32_t)src.width;
++    pc.texture_height[0] = (int32_t)src.height;
++    pc.texture_width[1] = (int32_t)outW;
++    pc.texture_height[1] = (int32_t)outH;
++    vkCmdPushConstants(cb, s.pipelineLayout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(pc), &pc);
++    VkViewport viewport = { 0.0f, 0.0f, (float)outW, (float)outH, 0.0f, 1.0f };
++    VkRect2D scissor = { { 0, 0 }, { outW, outH } };
++    vkCmdSetViewport(cb, 0, 1, &viewport);
++    vkCmdSetScissor(cb, 0, 1, &scissor);
++    vkCmdDraw(cb, 3, 1, 0, 0);
++    s.EndRenderPass();
++}
++
++} // namespace
++
++// The game framebuffer, upscaled with FSR when it is smaller than the output (or -1: show it as is).
++static int GdxFsrUpscale(GfxRenderingAPIVulkan* api, VulkanState& s, int srcFb) {
++    if (CVarGetInteger("gPs4.FsrMode", 0) == 0 || srcFb <= 0 || srcFb >= (int)s.framebuffers.size()) {
++        return -1;
++    }
++    const Framebuffer& in = s.framebuffers[srcFb];
++    if (in.width == 0 || in.height == 0 || in.height >= kOutH) {
++        return -1; // native or larger: nothing to upscale
++    }
++    if (!FsrPipelines(s)) {
++        return -1;
++    }
++    // output: the screen height, keeping the frame's aspect (ImGui then draws it 1:1)
++    uint32_t outH = kOutH;
++    uint32_t outW = (uint32_t)((uint64_t)in.width * kOutH / in.height);
++    if (outW > kOutW) {
++        outW = kOutW;
++        outH = (uint32_t)((uint64_t)in.height * kOutW / in.width);
++    }
++    for (int i = 0; i < 2; i++) {
++        if (s.fsrFb[i] < 0) {
++            s.fsrFb[i] = api->CreateFramebuffer();
++        }
++        api->UpdateFramebufferParameters(s.fsrFb[i], outW, outH, 1, false, true, false, false);
++    }
++    const int previousFb = s.currentFb;
++    // sharpness 0..10 (10 = sharpest) -> RCAS stops 2.0..0.0
++    const float stops = std::clamp(10 - CVarGetInteger("gPs4.FsrSharpness", 8), 0, 10) * 0.2f;
++    FsrPass(s, 0, srcFb, s.fsrFb[0], outW, outH, stops);
++    FsrPass(s, 1, s.fsrFb[0], s.fsrFb[1], outW, outH, stops);
++    s.MemoryBarrier(s.F().cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
++                    VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
++    s.currentFb = previousFb;
++    s.boundPipeline = VK_NULL_HANDLE;
++    s.boundSet = VK_NULL_HANDLE;
++    s.viewportDirty = s.scissorDirty = s.depthBiasDirty = true;
++    static bool sLogged = false;
++    if (!sLogged) {
++        sLogged = true;
++        Trace("FSR 1.0: %ux%u -> %ux%u", in.width, in.height, outW, outH);
++    }
++    return s.fsrFb[1];
++}
++
++void* GfxRenderingAPIVulkan::GetFramebufferTextureId(int fbId) {
++    VulkanState& s = *mState;
++    if (fbId <= 0 || fbId >= (int)s.framebuffers.size()) {
++        return nullptr;
++    }
++    {
++        const int upscaled = GdxFsrUpscale(this, s, fbId);
++        if (upscaled > 0) {
++            fbId = upscaled;
++        }
++    }
++    VkTex& t = s.textures[s.framebuffers[fbId].colorTex];
++    if (t.view == VK_NULL_HANDLE) {
++        return nullptr;
++    }
++    if (t.imgui == VK_NULL_HANDLE) {
++        t.imgui = ImGui_ImplVulkan_AddTexture(s.imguiSampler, t.view, VK_IMAGE_LAYOUT_GENERAL);
++    }
++    return (void*)t.imgui;
++}
++
++void GfxRenderingAPIVulkan::SelectTextureFb(int fbId) {
++    VulkanState& s = *mState;
++    if (fbId <= 0 || fbId >= (int)s.framebuffers.size()) {
++        return;
++    }
++    const uint32_t tex = s.framebuffers[fbId].colorTex;
++    SelectTexture(0, tex);
++    VkTex& t = s.textures[tex];
++    // What SetSamplerParameters(0, true, G_TX_WRAP, G_TX_WRAP) gives, as in the OpenGL backend.
++    t.linear = true;
++    t.cms = t.cmt = G_TX_WRAP;
++    t.filtering = FILTER_THREE_POINT;
++}
++
++void GfxRenderingAPIVulkan::ReadFramebufferToCPU(int fbId, uint32_t width, uint32_t height, uint16_t* rgba16Buf) {
++    VulkanState& s = *mState;
++    if (fbId < 0 || fbId >= (int)s.framebuffers.size() || width == 0 || height == 0) {
++        return;
++    }
++    Framebuffer& fb = s.framebuffers[fbId];
++    VkImage image = s.ColorImage(fbId);
++    if (image == VK_NULL_HANDLE) {
++        return;
++    }
++    s.BeginFrame();
++    s.EndRenderPass();
++    const VkDeviceSize size = (VkDeviceSize)fb.width * fb.height * 4;
++    if (s.readback.size < size) {
++        if (s.readback.buffer != VK_NULL_HANDLE) {
++            vmaDestroyBuffer(s.allocator, s.readback.buffer, s.readback.alloc);
++        }
++        s.readback = s.CreateHostBuffer(size, VK_BUFFER_USAGE_TRANSFER_DST_BIT, true);
++    }
++    VkCommandBuffer cb = s.F().cmd;
++    s.MemoryBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
++                    VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
++                    VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT);
++    VkBufferImageCopy region = {};
++    region.imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
++    region.imageExtent = { fb.width, fb.height, 1 };
++    vkCmdCopyImageToBuffer(cb, image, VK_IMAGE_LAYOUT_GENERAL, s.readback.buffer, 1, &region);
++    s.MemoryBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_HOST_BIT,
++                    VK_ACCESS_HOST_READ_BIT);
++    s.SubmitAndWait();
++    vmaInvalidateAllocation(s.allocator, s.readback.alloc, 0, VK_WHOLE_SIZE);
++
++    // Box-filter downscale into RGBA5551 with the coverage bit set, as the D3D11 backend does.
++    const uint32_t srcW = fb.width, srcH = fb.height;
++    const uint32_t* pixels = (const uint32_t*)s.readback.map;
++    for (uint32_t j = 0; j < height; j++) {
++        uint32_t sy0 = j * srcH / height, sy1 = (j + 1) * srcH / height;
++        if (sy1 <= sy0) {
++            sy1 = sy0 + 1;
++        }
++        sy1 = std::min(sy1, srcH);
++        for (uint32_t i = 0; i < width; i++) {
++            uint32_t sx0 = i * srcW / width, sx1 = (i + 1) * srcW / width;
++            if (sx1 <= sx0) {
++                sx1 = sx0 + 1;
++            }
++            sx1 = std::min(sx1, srcW);
++            uint32_t accR = 0, accG = 0, accB = 0, count = 0;
++            for (uint32_t sy = sy0; sy < sy1; sy++) {
++                const uint32_t* row = pixels + (size_t)sy * srcW;
++                for (uint32_t sx = sx0; sx < sx1; sx++) {
++                    const uint32_t p = row[sx];
++                    accR += p & 0xFF;
++                    accG += (p >> 8) & 0xFF;
++                    accB += (p >> 16) & 0xFF;
++                    ++count;
++                }
++            }
++            const uint32_t r = count ? accR / count : 0, g = count ? accG / count : 0, b = count ? accB / count : 0;
++            const uint8_t r5 = ((r + 4) * 0x1F) / 0xFF;
++            const uint8_t g5 = ((g + 4) * 0x1F) / 0xFF;
++            const uint8_t b5 = ((b + 4) * 0x1F) / 0xFF;
++            rgba16Buf[i + j * width] = (r5 << 11) | (g5 << 6) | (b5 << 1) | 1;
++        }
++    }
++}
++
++std::unordered_map<std::pair<float, float>, uint16_t, hash_pair_ff>
++GfxRenderingAPIVulkan::GetPixelDepth(int fb_id, const std::set<std::pair<float, float>>& coordinates) {
++    VulkanState& s = *mState;
++    std::unordered_map<std::pair<float, float>, uint16_t, hash_pair_ff> res;
++    if (fb_id < 0 || fb_id >= (int)s.framebuffers.size() || coordinates.empty()) {
++        return res;
++    }
++    Framebuffer& fb = s.framebuffers[fb_id];
++    if (!fb.hasDepth || fb.depth == VK_NULL_HANDLE) {
++        for (const auto& c : coordinates) {
++            res.emplace(c, 0);
++        }
++        return res;
++    }
++    s.BeginFrame();
++    s.EndRenderPass();
++    const VkDeviceSize size = coordinates.size() * 4;
++    if (s.readback.size < size) {
++        if (s.readback.buffer != VK_NULL_HANDLE) {
++            vmaDestroyBuffer(s.allocator, s.readback.buffer, s.readback.alloc);
++        }
++        s.readback = s.CreateHostBuffer(std::max<VkDeviceSize>(size, 4096), VK_BUFFER_USAGE_TRANSFER_DST_BIT, true);
++    }
++    std::vector<VkBufferImageCopy> regions;
++    regions.reserve(coordinates.size());
++    for (const auto& c : coordinates) {
++        VkBufferImageCopy r = {};
++        r.bufferOffset = regions.size() * 4;
++        r.imageSubresource = { VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1 };
++        // The interpreter's coordinates are OpenGL's (origin bottom-left); images are top-down.
++        const int x = std::clamp((int)c.first, 0, (int)fb.width - 1);
++        const int y = std::clamp((int)fb.height - 1 - (int)c.second, 0, (int)fb.height - 1);
++        r.imageOffset = { x, y, 0 };
++        r.imageExtent = { 1, 1, 1 };
++        regions.push_back(r);
++    }
++    VkCommandBuffer cb = s.F().cmd;
++    s.Barrier(cb, fb.depth, VK_IMAGE_ASPECT_DEPTH_BIT, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
++              VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
++              VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
++              VK_ACCESS_TRANSFER_READ_BIT);
++    vkCmdCopyImageToBuffer(cb, fb.depth, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, s.readback.buffer,
++                           (uint32_t)regions.size(), regions.data());
++    s.Barrier(cb, fb.depth, VK_IMAGE_ASPECT_DEPTH_BIT, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
++              VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL, VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
++              VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
++              VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT);
++    s.MemoryBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_HOST_BIT,
++                    VK_ACCESS_HOST_READ_BIT);
++    s.SubmitAndWait();
++    vmaInvalidateAllocation(s.allocator, s.readback.alloc, 0, VK_WHOLE_SIZE);
++    const float* depths = (const float*)s.readback.map;
++    size_t i = 0;
++    for (const auto& c : coordinates) {
++        res.emplace(c, (uint16_t)(depths[i++] * 65532.0f));
++    }
++    return res;
++}
++
++// ---- the paused frame (PS4 quick menu) ----
++
++ImTextureID GfxRenderingAPIVulkan::CaptureLastFrame() {
++    VulkanState& s = *mState;
++    if (s.flipsSubmitted == 0) {
++        return nullptr;
++    }
++    s.BeginFrame();
++    s.EndRenderPass();
++    VkTex& t = s.frozen;
++    if (t.image == VK_NULL_HANDLE) {
++        s.CreateImage(kOutW, kOutH, kColorFormat, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
++                      VK_IMAGE_ASPECT_COLOR_BIT, &t.image, &t.alloc, &t.view);
++        t.width = kOutW;
++        t.height = kOutH;
++        t.layout = VK_IMAGE_LAYOUT_GENERAL;
++        s.Barrier(s.F().upload, t.image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
++                  VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
++    }
++    VkCommandBuffer cb = s.F().cmd;
++    s.MemoryBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
++                    VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT,
++                    VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
++    VkImageCopy region = {};
++    region.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
++    region.dstSubresource = region.srcSubresource;
++    region.extent = { kOutW, kOutH, 1 };
++    vkCmdCopyImage(cb, s.swap[s.lastPresented].image, VK_IMAGE_LAYOUT_GENERAL, t.image, VK_IMAGE_LAYOUT_GENERAL, 1,
++                   &region);
++    s.MemoryBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
++                    VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
++    if (t.imgui == VK_NULL_HANDLE) {
++        t.imgui = ImGui_ImplVulkan_AddTexture(s.imguiSampler, t.view, VK_IMAGE_LAYOUT_GENERAL);
++    }
++    return (ImTextureID)t.imgui;
++}
++
++// ---- ImGui ----
++
++void GfxRenderingAPIVulkan::ImGuiInit() {
++    VulkanState& s = *mState;
++    ImGui_ImplVulkan_LoadFunctions(
++        VK_API_VERSION_1_1,
++        [](const char* name, void* user) -> PFN_vkVoidFunction {
++            VulkanState* st = (VulkanState*)user;
++            PFN_vkVoidFunction fn = vkGetDeviceProcAddr(st->device, name);
++            if (fn == nullptr) {
++                fn = vk_icdGetInstanceProcAddr(st->instance, name);
++            }
++            return fn != nullptr ? fn : (PFN_vkVoidFunction)MissingVulkanFunction;
++        },
++        &s);
++    ImGui_ImplVulkan_InitInfo info = {};
++    info.ApiVersion = VK_API_VERSION_1_1;
++    info.Instance = s.instance;
++    info.PhysicalDevice = s.gpu;
++    info.Device = s.device;
++    info.QueueFamily = s.queueFamily;
++    info.Queue = s.queue;
++    info.DescriptorPoolSize = 1024;
++    info.RenderPass = s.renderPass[1];
++    info.MinImageCount = 2;
++    info.ImageCount = kSwapImages;
++    info.MSAASamples = VK_SAMPLE_COUNT_1_BIT;
++    info.PipelineCache = s.pipelineCache;
++    info.CheckVkResultFn = [](VkResult r) {
++        if (r != VK_SUCCESS) {
++            Trace("ImGui Vulkan error %d", (int)r);
++        }
++    };
++    ImGui_ImplVulkan_Init(&info);
++    Trace("ImGui Vulkan backend ready");
++}
++
++void GfxRenderingAPIVulkan::ImGuiShutdown() {
++    if (mState->device != VK_NULL_HANDLE) {
++        vkDeviceWaitIdle(mState->device);
++    }
++    ImGui_ImplVulkan_Shutdown();
++}
++
++void GfxRenderingAPIVulkan::ImGuiNewFrame() {
++    ImGui_ImplVulkan_NewFrame();
++}
++
++void GfxRenderingAPIVulkan::ImGuiRender(ImDrawData* data) {
++    VulkanState& s = *mState;
++    const int previousFb = s.currentFb;
++    StartDrawToFramebuffer(0, 0.0f);
++    s.EnsureRenderPass();
++    if (s.inRenderPass) {
++        ImGui_ImplVulkan_RenderDrawData(data, s.F().cmd);
++    }
++    // ImGui changed the pipeline, descriptor set and dynamic state.
++    s.boundPipeline = VK_NULL_HANDLE;
++    s.boundSet = VK_NULL_HANDLE;
++    s.viewportDirty = s.scissorDirty = s.depthBiasDirty = true;
++    StartDrawToFramebuffer(previousFb, 0.0f);
++}
++
++} // namespace Fast
++#endif
+diff --git a/src/fast/backends/gfx_vulkan_shader.cpp b/src/fast/backends/gfx_vulkan_shader.cpp
+new file mode 100644
+index 00000000..ceb8edee
+--- /dev/null
++++ b/src/fast/backends/gfx_vulkan_shader.cpp
+@@ -0,0 +1,327 @@
++// Fast3D shader text for the Vulkan backend (see gfx_vulkan_shader.h).
++//
++// The template is the OpenGL backend's (shaders/opengl/default.shader.glsl), expanded with the same
++// formula helpers and GLSL 4.50 settings. Vulkan GLSL then needs explicit locations, sampler
++// bindings and no loose uniforms, so the expanded text is rewritten line by line: inputs get
++// locations in declaration order (the vertex attribute order the backend builds), varyings are
++// matched between the stages by name, samplers are bound by texture unit and the loose uniforms
++// are replaced by one push constant block.
++#include "fast/backends/gfx_vulkan_shader.h"
++
++#include <cstdio>
++#include <map>
++#include <regex>
++#include <sstream>
++
++#include <prism/processor.h>
++
++#include "fast/interpreter.h"
++
++namespace Fast {
++
++namespace {
++
++const char* kPushBlock = "layout(push_constant) uniform GdxPush {\n"
++                         "    int frame_count;\n"
++                         "    float noise_scale;\n"
++                         "    float prim_depth;\n"
++                         "    float alpha_compare_threshold;\n"
++                         "    int texture_width[2];\n"
++                         "    int texture_height[2];\n"
++                         "    int texture_filtering[2];\n"
++                         "};\n";
++
++#define RAND_NOISE "((random(vec3(floor(gl_FragCoord.xy * noise_scale), float(frame_count))) + 1.0) / 2.0)"
++
++const char* ShaderItemToStr(uint32_t item, bool with_alpha, bool only_alpha, bool inputs_have_alpha, bool first_cycle,
++                            bool hint_single_element) {
++    if (!only_alpha) {
++        switch (item) {
++            default:
++            case SHADER_0:
++                return with_alpha ? "vec4(0.0, 0.0, 0.0, 0.0)" : "vec3(0.0, 0.0, 0.0)";
++            case SHADER_1:
++                return with_alpha ? "vec4(1.0, 1.0, 1.0, 1.0)" : "vec3(1.0, 1.0, 1.0)";
++            case SHADER_INPUT_1:
++                return with_alpha || !inputs_have_alpha ? "vInput1" : "vInput1.rgb";
++            case SHADER_INPUT_2:
++                return with_alpha || !inputs_have_alpha ? "vInput2" : "vInput2.rgb";
++            case SHADER_INPUT_3:
++                return with_alpha || !inputs_have_alpha ? "vInput3" : "vInput3.rgb";
++            case SHADER_INPUT_4:
++                return with_alpha || !inputs_have_alpha ? "vInput4" : "vInput4.rgb";
++            case SHADER_TEXEL0:
++                return first_cycle ? (with_alpha ? "texVal0" : "texVal0.rgb")
++                                   : (with_alpha ? "texVal1" : "texVal1.rgb");
++            case SHADER_TEXEL0A:
++                return first_cycle
++                           ? (hint_single_element ? "texVal0.a"
++                                                  : (with_alpha ? "vec4(texVal0.a, texVal0.a, texVal0.a, texVal0.a)"
++                                                                : "vec3(texVal0.a, texVal0.a, texVal0.a)"))
++                           : (hint_single_element ? "texVal1.a"
++                                                  : (with_alpha ? "vec4(texVal1.a, texVal1.a, texVal1.a, texVal1.a)"
++                                                                : "vec3(texVal1.a, texVal1.a, texVal1.a)"));
++            case SHADER_TEXEL1A:
++                return first_cycle
++                           ? (hint_single_element ? "texVal1.a"
++                                                  : (with_alpha ? "vec4(texVal1.a, texVal1.a, texVal1.a, texVal1.a)"
++                                                                : "vec3(texVal1.a, texVal1.a, texVal1.a)"))
++                           : (hint_single_element ? "texVal0.a"
++                                                  : (with_alpha ? "vec4(texVal0.a, texVal0.a, texVal0.a, texVal0.a)"
++                                                                : "vec3(texVal0.a, texVal0.a, texVal0.a)"));
++            case SHADER_TEXEL1:
++                return first_cycle ? (with_alpha ? "texVal1" : "texVal1.rgb")
++                                   : (with_alpha ? "texVal0" : "texVal0.rgb");
++            case SHADER_COMBINED:
++                return with_alpha ? "texel" : "texel.rgb";
++            case SHADER_NOISE:
++                return with_alpha ? "vec4(" RAND_NOISE ", " RAND_NOISE ", " RAND_NOISE ", " RAND_NOISE ")"
++                                  : "vec3(" RAND_NOISE ", " RAND_NOISE ", " RAND_NOISE ")";
++        }
++    } else {
++        switch (item) {
++            default:
++            case SHADER_0:
++                return "0.0";
++            case SHADER_1:
++                return "1.0";
++            case SHADER_INPUT_1:
++                return "vInput1.a";
++            case SHADER_INPUT_2:
++                return "vInput2.a";
++            case SHADER_INPUT_3:
++                return "vInput3.a";
++            case SHADER_INPUT_4:
++                return "vInput4.a";
++            case SHADER_TEXEL0:
++                return first_cycle ? "texVal0.a" : "texVal1.a";
++            case SHADER_TEXEL0A:
++                return first_cycle ? "texVal0.a" : "texVal1.a";
++            case SHADER_TEXEL1A:
++                return first_cycle ? "texVal1.a" : "texVal0.a";
++            case SHADER_TEXEL1:
++                return first_cycle ? "texVal1.a" : "texVal0.a";
++            case SHADER_COMBINED:
++                return "texel.a";
++            case SHADER_NOISE:
++                return RAND_NOISE;
++        }
++    }
++}
++
++bool GetBool(prism::ContextTypes* value) {
++    if (std::holds_alternative<int>(*value)) {
++        return std::get<int>(*value) == 1;
++    }
++    return false;
++}
++
++prism::ContextTypes* AppendFormula(prism::ContextTypes* _, prism::ContextTypes* a_arg, prism::ContextTypes* a_single,
++                                   prism::ContextTypes* a_mult, prism::ContextTypes* a_mix,
++                                   prism::ContextTypes* a_with_alpha, prism::ContextTypes* a_only_alpha,
++                                   prism::ContextTypes* a_alpha, prism::ContextTypes* a_first_cycle) {
++    auto c = std::get<prism::MTDArray<int>>(*a_arg);
++    bool do_single = GetBool(a_single);
++    bool do_multiply = GetBool(a_mult);
++    bool do_mix = GetBool(a_mix);
++    bool with_alpha = GetBool(a_with_alpha);
++    bool only_alpha = GetBool(a_only_alpha);
++    bool opt_alpha = GetBool(a_alpha);
++    bool first_cycle = GetBool(a_first_cycle);
++    std::string out;
++    if (do_single) {
++        out += ShaderItemToStr(c.at(only_alpha, 3), with_alpha, only_alpha, opt_alpha, first_cycle, false);
++    } else if (do_multiply) {
++        out += ShaderItemToStr(c.at(only_alpha, 0), with_alpha, only_alpha, opt_alpha, first_cycle, false);
++        out += " * ";
++        out += ShaderItemToStr(c.at(only_alpha, 2), with_alpha, only_alpha, opt_alpha, first_cycle, true);
++    } else if (do_mix) {
++        out += "mix(";
++        out += ShaderItemToStr(c.at(only_alpha, 1), with_alpha, only_alpha, opt_alpha, first_cycle, false);
++        out += ", ";
++        out += ShaderItemToStr(c.at(only_alpha, 0), with_alpha, only_alpha, opt_alpha, first_cycle, false);
++        out += ", ";
++        out += ShaderItemToStr(c.at(only_alpha, 2), with_alpha, only_alpha, opt_alpha, first_cycle, true);
++        out += ")";
++    } else {
++        out += "(";
++        out += ShaderItemToStr(c.at(only_alpha, 0), with_alpha, only_alpha, opt_alpha, first_cycle, false);
++        out += " - ";
++        out += ShaderItemToStr(c.at(only_alpha, 1), with_alpha, only_alpha, opt_alpha, first_cycle, false);
++        out += ") * ";
++        out += ShaderItemToStr(c.at(only_alpha, 2), with_alpha, only_alpha, opt_alpha, first_cycle, true);
++        out += " + ";
++        out += ShaderItemToStr(c.at(only_alpha, 3), with_alpha, only_alpha, opt_alpha, first_cycle, false);
++    }
++    return new prism::ContextTypes{ out };
++}
++
++size_t sNumFloats = 0;
++prism::ContextTypes* UpdateFloats(prism::ContextTypes* _, prism::ContextTypes* num) {
++    sNumFloats += std::get<int>(*num);
++    return nullptr;
++}
++
++std::string ExpandTemplate(const std::string& templateText, GdxShaderIncludeFunc include,
++                           prism::ContextItems& context) {
++    prism::Processor processor;
++    processor.populate(context);
++    processor.load(templateText);
++    if (include != nullptr) {
++        processor.bind_include_loader(include);
++    }
++    return processor.process();
++}
++
++std::string BuildVs(const CCFeatures& cc, const std::string& templ, GdxShaderIncludeFunc include) {
++    sNumFloats = 4;
++    prism::ContextItems context = { { "VERTEX_SHADER", true },
++                                    { "o_textures", M_ARRAY(cc.usedTextures, bool, 2) },
++                                    { "o_clamp", M_ARRAY(cc.clamp, bool, 2, 2) },
++                                    { "o_fog", cc.opt_fog },
++                                    { "o_grayscale", cc.opt_grayscale },
++                                    { "o_alpha", cc.opt_alpha },
++                                    { "o_inputs", cc.numInputs },
++                                    { "update_floats", (InvokeFunc)UpdateFloats },
++                                    { "GLSL_VERSION", "#version 450" },
++                                    { "attr", "in" },
++                                    { "out", "out" },
++                                    { "opengles", false } };
++    return ExpandTemplate(templ, include, context);
++}
++
++std::string BuildFs(const CCFeatures& cc, bool threePoint, bool srgb, const std::string& templ,
++                    GdxShaderIncludeFunc include) {
++    prism::ContextItems context = {
++        { "VERTEX_SHADER", false },
++        { "o_c", M_ARRAY(cc.c, int, 2, 2, 4) },
++        { "o_alpha", cc.opt_alpha },
++        { "o_fog", cc.opt_fog },
++        { "o_texture_edge", cc.opt_texture_edge },
++        { "o_noise", cc.opt_noise },
++        { "o_2cyc", cc.opt_2cyc },
++        { "o_alpha_threshold", cc.opt_alpha_threshold },
++        { "o_invisible", cc.opt_invisible },
++        { "o_grayscale", cc.opt_grayscale },
++        { "o_prim_depth", cc.opt_prim_depth },
++        { "o_textures", M_ARRAY(cc.usedTextures, bool, 2) },
++        { "o_masks", M_ARRAY(cc.used_masks, bool, 2) },
++        { "o_blend", M_ARRAY(cc.used_blend, bool, 2) },
++        { "o_clamp", M_ARRAY(cc.clamp, bool, 2, 2) },
++        { "o_inputs", cc.numInputs },
++        { "o_do_mix", M_ARRAY(cc.do_mix, bool, 2, 2) },
++        { "o_do_single", M_ARRAY(cc.do_single, bool, 2, 2) },
++        { "o_do_multiply", M_ARRAY(cc.do_multiply, bool, 2, 2) },
++        { "o_color_alpha_same", M_ARRAY(cc.color_alpha_same, bool, 2) },
++        { "FILTER_THREE_POINT", FILTER_THREE_POINT },
++        { "FILTER_LINEAR", FILTER_LINEAR },
++        { "FILTER_NONE", FILTER_NONE },
++        { "srgb_mode", srgb },
++        { "SHADER_0", SHADER_0 },
++        { "SHADER_INPUT_1", SHADER_INPUT_1 },
++        { "SHADER_INPUT_2", SHADER_INPUT_2 },
++        { "SHADER_INPUT_3", SHADER_INPUT_3 },
++        { "SHADER_INPUT_4", SHADER_INPUT_4 },
++        { "SHADER_INPUT_5", SHADER_INPUT_5 },
++        { "SHADER_INPUT_6", SHADER_INPUT_6 },
++        { "SHADER_INPUT_7", SHADER_INPUT_7 },
++        { "SHADER_TEXEL0", SHADER_TEXEL0 },
++        { "SHADER_TEXEL0A", SHADER_TEXEL0A },
++        { "SHADER_TEXEL1", SHADER_TEXEL1 },
++        { "SHADER_TEXEL1A", SHADER_TEXEL1A },
++        { "SHADER_1", SHADER_1 },
++        { "SHADER_COMBINED", SHADER_COMBINED },
++        { "SHADER_NOISE", SHADER_NOISE },
++        { "o_three_point_filtering", threePoint },
++        { "append_formula", (InvokeFunc)AppendFormula },
++        { "GLSL_VERSION", "#version 450" },
++        { "attr", "in" },
++        { "opengles", false },
++        { "core_opengl", true },
++        { "texture", "texture" },
++        { "vOutColor", "vOutColor" },
++    };
++    return ExpandTemplate(templ, include, context);
++}
++
++int SamplerBinding(const std::string& name) {
++    static const char* const names[SHADER_MAX_TEXTURES] = { "uTex0",     "uTex1",      "uTexMask0",
++                                                            "uTexMask1", "uTexBlend0", "uTexBlend1" };
++    for (int i = 0; i < SHADER_MAX_TEXTURES; i++) {
++        if (name == names[i]) {
++            return i;
++        }
++    }
++    return -1;
++}
++
++// GLSL 4.50 as the template emits it -> Vulkan GLSL. `varyings` maps varying names to locations:
++// filled by the vertex shader, read by the fragment shader.
++std::string RewriteForVulkan(const std::string& src, bool vertex, std::map<std::string, int>& varyings) {
++    static const std::regex reIo(R"(^\s*(in|out)\s+(\w+)\s+(\w+)\s*;\s*$)");
++    static const std::regex reSampler(R"(^\s*uniform\s+sampler2D\s+(\w+)\s*;\s*$)");
++    static const std::regex reUniform(R"(^\s*uniform\s+\w+\s+\w+\s*(\[\s*\d+\s*\])?\s*;\s*$)");
++    std::istringstream in(src);
++    std::ostringstream out;
++    std::string line;
++    int attribLocation = 0;
++    int varyingLocation = 0;
++    bool versionDone = false;
++    while (std::getline(in, line)) {
++        std::smatch m;
++        if (!versionDone && line.find("#version") != std::string::npos) {
++            out << "#version 450\n";
++            if (!vertex) {
++                out << kPushBlock;
++            }
++            versionDone = true;
++            continue;
++        }
++        if (std::regex_match(line, m, reIo)) {
++            const std::string dir = m[1], type = m[2], name = m[3];
++            int location = 0;
++            if (vertex && dir == "in") {
++                location = attribLocation++;
++            } else if (vertex) {
++                location = varyingLocation++;
++                varyings[name] = location;
++            } else if (dir == "in") {
++                auto it = varyings.find(name);
++                location = it != varyings.end() ? it->second : 15;
++                if (it == varyings.end()) {
++                    fprintf(stderr, "gfx_vulkan_shader: fragment input %s has no matching vertex output\n",
++                                            name.c_str());
++                }
++            } else {
++                location = 0; // the color output
++            }
++            out << "layout(location = " << location << ") " << dir << " " << type << " " << name << ";\n";
++            continue;
++        }
++        if (std::regex_match(line, m, reSampler)) {
++            const int binding = SamplerBinding(m[1]);
++            out << "layout(set = 0, binding = " << (binding < 0 ? 0 : binding) << ") uniform sampler2D " << m[1]
++                << ";\n";
++            continue;
++        }
++        if (std::regex_match(line, m, reUniform)) {
++            continue; // provided by the push constant block
++        }
++        out << line << "\n";
++    }
++    return out.str();
++}
++
++} // namespace
++
++GdxVulkanShaderText GdxBuildVulkanShaders(const CCFeatures& cc, const std::string& templateText,
++                                          bool threePointFiltering, bool srgb, GdxShaderIncludeFunc include) {
++    GdxVulkanShaderText out;
++    std::map<std::string, int> varyings;
++    out.vs = RewriteForVulkan(BuildVs(cc, templateText, include), true, varyings);
++    out.numFloats = sNumFloats;
++    out.fs = RewriteForVulkan(BuildFs(cc, threePointFiltering, srgb, templateText, include), false, varyings);
++    return out;
++}
++
++} // namespace Fast
+diff --git a/src/fast/interpreter.cpp b/src/fast/interpreter.cpp
+index c52df185..b6d04376 100644
+--- a/src/fast/interpreter.cpp
++++ b/src/fast/interpreter.cpp
+@@ -6304,6 +6304,11 @@ bool gfx_othermode_h_handler_f3d(F3DGfx** cmd0) {
+     return false;
+ }
+ 
++#ifdef __ORBIS__
++extern "C" char __text_start[]; // OpenOrbis link.x: start of the eboot image
++extern "C" char _end[];         // end of .bss (ps4-love-style.cmake linker script patch)
++#endif
++
+ bool gfx_set_timg_handler_rdp(F3DGfx** cmd0) {
+     Interpreter* gfx = mInstance.lock().get();
+     F3DGfx* cmd = *cmd0;
+@@ -6350,6 +6355,13 @@ bool gfx_set_timg_handler_rdp(F3DGfx** cmd0) {
+                              reinterpret_cast<LPCSTR>(i), &module))) {
+         return false;
+     }
++#elif defined(__ORBIS__)
++    // PS4: the eboot is mapped at 0x400000, so textures in the image itself (.data palettes, .bss
++    // arenas such as the minimap, HUD digit and shadow buffers) sit below 0x10000000. They are host
++    // pointers, not unresolved segment addresses.
++    if (i <= 0x0FFFFFFF && !(i >= reinterpret_cast<uintptr_t>(__text_start) && i < reinterpret_cast<uintptr_t>(_end))) {
++        return false;
++    }
+ #else
+     if (i <= 0x0FFFFFFF) {
+         return false;
+diff --git a/src/ship/Context.cpp b/src/ship/Context.cpp
+index 2fe754be..90bc9d5a 100644
+--- a/src/ship/Context.cpp
++++ b/src/ship/Context.cpp
+@@ -4,6 +4,35 @@
+ #include <iostream>
+ #include <spdlog/sinks/rotating_file_sink.h>
+ #include <spdlog/sinks/stdout_color_sinks.h>
++#ifdef __ORBIS__
++#include <spdlog/sinks/base_sink.h>
++#include <mutex>
++
++extern "C" __attribute__((weak)) void ps4_boot_trace(const char* line); // port/ps4 boot-trace.log
++
++namespace {
++// Warnings and errors (the interpreter's texture/import failures among them) into boot-trace.log,
++// capped so a per-frame warning cannot fill the console's storage.
++class Ps4TraceSink final : public spdlog::sinks::base_sink<std::mutex> {
++  protected:
++    void sink_it_(const spdlog::details::log_msg& msg) override {
++        if (msg.level < spdlog::level::warn || ps4_boot_trace == nullptr || mLines >= 3000) {
++            return;
++        }
++        ++mLines;
++        std::string line = "[lus] ";
++        line.append(msg.payload.data(), msg.payload.size());
++        line += "\n";
++        ps4_boot_trace(line.c_str());
++    }
++    void flush_() override {
++    }
++
++  private:
++    int mLines = 0;
++};
++} // namespace
++#endif
+ #include "ship/install_config.h"
+ #include "ship/config/ConsoleVariable.h"
+ #include "ship/controller/controldeck/ControlDeck.h"
+@@ -159,6 +188,9 @@ bool Context::InitLogging(spdlog::level::level_enum debugBuildLogLevel,
+         sinks.push_back(systemConsoleSink);
+ #endif
+ 
++#ifdef __ORBIS__
++        sinks.push_back(std::make_shared<Ps4TraceSink>());
++#endif
+         if (enableFileSink) {
+             auto logPath = GetPathRelativeToAppDirectory(("logs/" + GetName() + ".log"));
+             auto fileSink = std::make_shared<spdlog::sinks::rotating_file_sink_mt>(logPath, 1024 * 1024 * 10, 10);
+@@ -454,6 +486,9 @@ std::string Context::GetShortName() const {
+ }
+ 
+ std::string Context::GetAppBundlePath() {
++#ifdef __ORBIS__
++    return "/data/gdiffuser"; // G-Diffuser-PS4 copies the packaged files here at startup
++#endif
+ #if defined(__ANDROID__)
+     const char* externaldir = SDL_AndroidGetExternalStoragePath();
+     if (externaldir != NULL) {
+@@ -517,6 +552,9 @@ std::string Context::GetAppBundlePath() {
+ }
+ 
+ std::string Context::GetAppDirectoryPath(const std::string& appName) {
++#ifdef __ORBIS__
++    return "/data/gdiffuser";
++#endif
+ #if defined(__ANDROID__)
+     const char* externaldir = SDL_AndroidGetExternalStoragePath();
+     if (externaldir != NULL) {
+diff --git a/src/ship/audio/Audio.cpp b/src/ship/audio/Audio.cpp
+index 40140b60..10f660d0 100644
+--- a/src/ship/audio/Audio.cpp
++++ b/src/ship/audio/Audio.cpp
+@@ -15,6 +15,15 @@ Audio::~Audio() {
+ }
+ 
+ void Audio::InitAudioPlayer() {
++#ifdef __ORBIS__
++    // PS4: sceAudioOut whatever the saved backend says (PacBrew SDL2 has no console audio output).
++    mAudioPlayer = std::make_shared<Ps4AudioPlayer>(this->mAudioSettings);
++    if (!mAudioPlayer->Init()) {
++        SetCurrentAudioBackend(AudioBackend::NUL);
++        mAudioPlayer = std::make_shared<NullAudioPlayer>(this->mAudioSettings);
++    }
++    return;
++#endif
+     switch (GetCurrentAudioBackend()) {
+ #ifdef _WIN32
+         case AudioBackend::WASAPI:
+diff --git a/src/ship/audio/Ps4AudioPlayer.cpp b/src/ship/audio/Ps4AudioPlayer.cpp
+new file mode 100644
+index 00000000..c51fd59d
+--- /dev/null
++++ b/src/ship/audio/Ps4AudioPlayer.cpp
+@@ -0,0 +1,141 @@
++#ifdef __ORBIS__
++#include "ship/audio/Ps4AudioPlayer.h"
++
++#include <orbis/AudioOut.h>
++#include <spdlog/spdlog.h>
++
++#include <algorithm>
++#include <cstring>
++
++extern "C" __attribute__((weak)) void ps4_boot_trace(const char* line); // port/ps4 boot-trace.log
++
++namespace Ship {
++
++namespace {
++constexpr int32_t kSystemUser = 0xFF;
++constexpr uint32_t kOutRate = 48000; // the only rate sceAudioOut takes
++constexpr uint32_t kGrain = 256;     // output frames per sceAudioOutOutput
++constexpr size_t kRingFrames = 16384;
++
++void trace(const char* line) {
++    if (ps4_boot_trace != nullptr) {
++        ps4_boot_trace(line);
++    }
++}
++} // namespace
++
++Ps4AudioPlayer::~Ps4AudioPlayer() {
++    DoClose();
++}
++
++bool Ps4AudioPlayer::DoInit() {
++    mNumChannels = GetNumOutputChannels();
++    const int32_t init = sceAudioOutInit();
++    if (init != 0 && init != (int32_t)0x8026000E) { // 0x8026000E: already initialized
++        char line[96];
++        snprintf(line, sizeof(line), "[audio] sceAudioOutInit failed: %#x\n", (unsigned)init);
++        trace(line);
++        return false;
++    }
++    mPort = sceAudioOutOpen(kSystemUser, ORBIS_AUDIO_OUT_PORT_TYPE_MAIN, 0, kGrain, kOutRate,
++                            ORBIS_AUDIO_OUT_PARAM_FORMAT_S16_STEREO);
++    if (mPort < 0) {
++        char line[96];
++        snprintf(line, sizeof(line), "[audio] sceAudioOutOpen failed: %#x\n", (unsigned)mPort);
++        trace(line);
++        mPort = -1;
++        return false;
++    }
++    int32_t volume[2] = { 32768, 32768 };
++    sceAudioOutSetVolume(mPort, 0x3, volume);
++    {
++        std::lock_guard<std::mutex> lock(mMutex);
++        mRing.assign(kRingFrames * 2, 0);
++        mRead = 0;
++        mCount = 0;
++    }
++    mRunning = true;
++    mThread = std::thread(&Ps4AudioPlayer::OutputLoop, this);
++    char line[128];
++    snprintf(line, sizeof(line), "[audio] sceAudioOut port %d: %d Hz game stream -> %u Hz, %d channel(s) in\n", mPort,
++             GetSampleRate(), kOutRate, mNumChannels);
++    trace(line);
++    return true;
++}
++
++void Ps4AudioPlayer::DoClose() {
++    if (mRunning.exchange(false) && mThread.joinable()) {
++        mThread.join();
++    }
++    if (mPort >= 0) {
++        sceAudioOutClose(mPort);
++        mPort = -1;
++    }
++}
++
++int Ps4AudioPlayer::Buffered() {
++    std::lock_guard<std::mutex> lock(mMutex);
++    return (int)mCount;
++}
++
++void Ps4AudioPlayer::DoPlay(const uint8_t* buf, size_t len) {
++    const int16_t* in = reinterpret_cast<const int16_t*>(buf);
++    const size_t frames = len / (sizeof(int16_t) * mNumChannels);
++    std::lock_guard<std::mutex> lock(mMutex);
++    if (mRing.empty()) {
++        return;
++    }
++    for (size_t i = 0; i < frames && mCount < kRingFrames; i++) {
++        const int16_t* f = in + i * mNumChannels;
++        int32_t l = f[0], r = f[1];
++        if (mNumChannels == 6) {
++            // FL FR C LFE SL SR: fold centre and surrounds back to stereo
++            l = f[0] + (f[2] * 7 / 10) + (f[4] * 7 / 10);
++            r = f[1] + (f[2] * 7 / 10) + (f[5] * 7 / 10);
++        }
++        const size_t w = (mRead + mCount) % kRingFrames;
++        mRing[w * 2] = (int16_t)std::clamp(l, -32768, 32767);
++        mRing[w * 2 + 1] = (int16_t)std::clamp(r, -32768, 32767);
++        mCount++;
++    }
++}
++
++void Ps4AudioPlayer::OutputLoop() {
++    alignas(64) int16_t out[kGrain * 2];
++    const uint32_t inRate = (uint32_t)std::max(GetSampleRate(), 1);
++    // 16.16 fixed-point step through the input per output frame
++    const uint64_t step = ((uint64_t)inRate << 16) / kOutRate;
++    uint64_t frac = 0;
++    int16_t lastL = 0, lastR = 0;
++    while (mRunning) {
++        {
++            std::lock_guard<std::mutex> lock(mMutex);
++            for (uint32_t i = 0; i < kGrain; i++) {
++                if (mCount < 2) {
++                    // underrun: hold the last sample, decaying, rather than click
++                    lastL = (int16_t)(lastL * 31 / 32);
++                    lastR = (int16_t)(lastR * 31 / 32);
++                    out[i * 2] = lastL;
++                    out[i * 2 + 1] = lastR;
++                    continue;
++                }
++                const size_t a = mRead % kRingFrames, b = (mRead + 1) % kRingFrames;
++                const int32_t t = (int32_t)(frac & 0xFFFF);
++                const int32_t l = mRing[a * 2] + (((mRing[b * 2] - mRing[a * 2]) * t) >> 16);
++                const int32_t r = mRing[a * 2 + 1] + (((mRing[b * 2 + 1] - mRing[a * 2 + 1]) * t) >> 16);
++                out[i * 2] = lastL = (int16_t)l;
++                out[i * 2 + 1] = lastR = (int16_t)r;
++                frac += step;
++                const size_t advance = (size_t)(frac >> 16);
++                frac &= 0xFFFF;
++                mRead = (mRead + advance) % kRingFrames;
++                mCount -= std::min(mCount, advance);
++            }
++        }
++        sceAudioOutOutput(mPort, out); // blocks for one grain
++    }
++    sceAudioOutOutput(mPort, nullptr); // wait for the last grain
++}
++
++} // namespace Ship
++#endif

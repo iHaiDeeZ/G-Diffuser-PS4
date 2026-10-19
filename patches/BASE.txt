@@ -1,0 +1,5 @@
+G-Diffuser     https://github.com/Zorkats/G-Diffuser             535abe9559934fda7a3493c038fd238a0ef3394a
+libultraship   https://github.com/Zorkats/libultraship           f7f2f41ff4dfc3e3c4d4de15c1795ede7da781ca
+decomp         https://github.com/Zorkats/fzerox (g-diffuser)    f556d9409737e61016a58ab2bd684b52d51ee057
+torch          https://github.com/Zorkats/Torch                  8bdae395876b31f70c599d607c2babcb941abbd3
+fzerox-expansion-kit https://github.com/Zorkats/fzerox-expansion-kit 6cd71e6fff1714fbfbda22d61dc8bce190d9632d

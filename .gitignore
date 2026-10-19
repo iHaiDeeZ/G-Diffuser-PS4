@@ -1,0 +1,14 @@
+# Nintendo files and anything extracted from them: never commit or redistribute.
+*.z64
+*.n64
+*.v64
+*.ndd
+*.o2r
+# Sony system modules: never commit or redistribute.
+modules/*.sprx
+*.pkg
+*.self
+*.oelf
+eboot.bin
+out/
+__pycache__/

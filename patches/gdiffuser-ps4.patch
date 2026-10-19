@@ -1,0 +1,3051 @@
+diff --git a/port/CMakeLists.txt b/port/CMakeLists.txt
+index 994a073..2d9a71c 100644
+--- a/port/CMakeLists.txt
++++ b/port/CMakeLists.txt
+@@ -1,5 +1,11 @@
+ # port/ — game glue + decomp game sources compiled for the host. Kept standalone-capable so the
+ # decomp compile can iterate without rebuilding libultraship.
++# GDX_LOW_IMAGE: Windows test build with the PS4 address layout (port/gdx_lowimage_win.cpp).
++option(GDX_LOW_IMAGE "Windows test build with the PS4 address layout" OFF)
++if(GDX_LOW_IMAGE)
++    add_compile_definitions(GDX_LOW_IMAGE)
++endif()
++
+ cmake_minimum_required(VERSION 3.20)
+ if(NOT DEFINED PROJECT_NAME)
+     project(gdiffuser_port LANGUAGES C CXX)
+@@ -170,6 +176,9 @@ endif()
+ # POSIX ucontext elsewhere.
+ if(WIN32)
+     target_sources(gdiffuser_game PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/gdx_fiber_win32.c")
++elseif(PS4)
++    # The PS4's musl libc has no ucontext: hand-written x86-64 switch.
++    target_sources(gdiffuser_game PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/gdx_fiber_ps4.c")
+ else()
+     target_sources(gdiffuser_game PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/gdx_fiber_ucontext.c")
+ endif()
+@@ -250,7 +259,10 @@ endif()
+ 
+ # Discord Rich Presence: vendored static discord-rpc (see its CMakeLists for provenance and the
+ # strip rationale). EXCLUDE_FROM_ALL keeps it out of the test targets' builds.
+-add_subdirectory(third_party/discord-rpc EXCLUDE_FROM_ALL)
++# PS4: no Discord client to talk to; port/ps4/discord_stub.c provides no-op Discord_* entry points.
++if(NOT PS4)
++    add_subdirectory(third_party/discord-rpc EXCLUDE_FROM_ALL)
++endif()
+ 
+ # Lua 5.4.8: vendored static lib for the scripting layer. Dormant for now — linked by both
+ # executables but no port code references it yet (the runtime core lands separately).
+@@ -371,6 +383,15 @@ if(WIN32)
+     if(MSVC)
+         target_link_options(G-Diffuser PRIVATE "/MAP")
+     endif()
++    # GDX_LOW_IMAGE: a TEST build reproducing the PS4 address layout (image below 4 GiB, heap above;
++    # see port/gdx_lowimage_win.cpp). Never for releases -- see the /DYNAMICBASE:NO note above.
++    if(GDX_LOW_IMAGE AND MSVC)
++        target_sources(G-Diffuser PRIVATE gdx_lowimage_win.cpp)
++        # Base chosen so the image ENDS where the PS4 eboot does (~0x40E0000): its .data/.bss and the
++        # asset placeholders then sit at the same 0x02xxxxxx-0x040Exxxxx values as on the console.
++        set(GDX_LOW_IMAGE_BASE "0x2160000" CACHE STRING "GDX_LOW_IMAGE link base")
++        target_link_options(G-Diffuser PRIVATE "/BASE:${GDX_LOW_IMAGE_BASE}" "/DYNAMICBASE:NO" "/HIGHENTROPYVA:NO")
++    endif()
+ endif()
+ 
+ # Scrubs a game-derived icon that older build trees still carry; harmless on a clean tree.
+@@ -442,6 +463,9 @@ add_custom_command(TARGET G-Diffuser POST_BUILD
+             "$<TARGET_FILE_DIR:G-Diffuser>/shaders"
+     VERBATIM)
+ 
++# PS4: no child processes, so no gdx-extract and no recipes; the package carries the game
++# data archives built by the PC version's first boot (scripts/package-gdx.sh).
++if(NOT PS4)
+ # gdx-extract, the standalone deterministic O2R extractor first boot spawns as a child process.
+ # Isolated ExternalProject, NOT add_subdirectory'd:
+ # Torch pulls its own spdlog/fmt/yaml-cpp via FetchContent, and out-of-tree prevents ODR/version
+@@ -520,6 +544,8 @@ add_custom_command(TARGET G-Diffuser POST_BUILD
+             --ek-yaml-dir "${CMAKE_SOURCE_DIR}/fzerox-expansion-kit/assets/yaml/jp"
+     VERBATIM)
+ 
++endif() # NOT PS4
++
+ target_include_directories(G-Diffuser PRIVATE
+     "${CMAKE_CURRENT_SOURCE_DIR}"   # for "resource/ResourceFactories.h"
+     "${DECOMP}/include"
+@@ -528,12 +554,32 @@ target_include_directories(G-Diffuser PRIVATE
+ )
+ 
+ target_link_libraries(G-Diffuser PRIVATE cxd4_rsp)
+-target_link_libraries(G-Diffuser PRIVATE discord-rpc)
++if(PS4)
++    target_sources(G-Diffuser PRIVATE ps4/discord_stub.c)
++    target_include_directories(G-Diffuser PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/third_party/discord-rpc/include")
++else()
++    target_link_libraries(G-Diffuser PRIVATE discord-rpc)
++endif()
+ target_link_libraries(G-Diffuser PRIVATE gdx_lua)
+ 
+ if(WIN32)
+     # user32: MessageBox; Comdlg32: ROM picker; Comctl32: extraction progress marquee.
+     target_link_libraries(G-Diffuser PRIVATE user32 Comdlg32 Comctl32)
++elseif(PS4)
++    # PS4 runtime (heap, crash log, thread-exit fixes; toolchain/ps4-love-style.cmake), Mesa's
++    # RADV for the Vulkan renderer, and the system libraries the PS4 glue calls into.
++    target_sources(G-Diffuser PRIVATE ${PS4_RUNTIME_SOURCES} ps4/ps4_platform.cpp
++        ps4/ps4_paths.cpp ps4/quick_menu.cpp)
++    ps4_link_mesa(G-Diffuser)
++    target_link_libraries(G-Diffuser PRIVATE -lSceVideoOut -lSceGnmDriver -lSceSystemService
++        -lSceUserService -lScePad -lSceAudioOut -lSceSysmodule -lSceSaveData -lSceCommonDialog
++        -lSceImeDialog -lpthread)
++    # getcwd and readlink("/proc/self/exe") fail on the console (port/ps4/ps4_platform.cpp), and
++    # relative paths do not resolve: the path-taking libc calls are wrapped (port/ps4/ps4_paths.cpp).
++    target_link_options(G-Diffuser PRIVATE --wrap=getcwd --wrap=readlink --wrap=mkdir --wrap=open
++        --wrap=fopen --wrap=stat --wrap=lstat --wrap=access --wrap=rmdir --wrap=unlink --wrap=remove
++        --wrap=rename --wrap=opendir --wrap=truncate)
++    ps4_add_eboot(G-Diffuser)
+ else()
+     # pthread for the fiber backend + audio thread; dl for dladdr in n64_gfx_bridge.cpp
+     # (needed on older glibc, harmless on newer).
+@@ -555,6 +601,10 @@ endif()
+ # host pointers and resolves host ranges by bit-pattern — all strict-aliasing-sensitive.
+ if(NOT MSVC)
+     target_compile_options(G-Diffuser PRIVATE -fno-strict-aliasing -fwrapv)
++endif()
++# PS4: a static executable linked by ld.lld directly (no dynamic sinf/cosf to interpose, and no
++# -Wl, driver flags).
++if(NOT MSVC AND NOT PS4)
+     # Linux audio fix: the decomp's sinf/cosf were exported from .dynsym and interposed the ones
+     # libSDL3's resampler imports -> silent/garbled audio. The version script localizes them so
+     # libSDL3 gets glibc's. Full writeup in port/gdx_hide_libm.map.
+@@ -569,6 +619,7 @@ if(TARGET libultraship)
+     )
+ endif()
+ 
++if(NOT PS4) # host unit tests
+ # DSP unit-test harness: compiles n64_audio_hle.c UNMODIFIED and drives it black-box through
+ # gdx_audio_hle_run (design rationale in dsp_tests.c's header). Stand-ins for the two
+ # gdx_resolve_*_host_address externs live in dsp_tests.c, so n64_gfx_bridge.cpp stays out.
+@@ -788,6 +839,7 @@ else()
+     # Vendored C89 cxd4 sources dominate this target.
+     target_compile_options(gdx_rsp_boot_tests PRIVATE -w)
+ endif()
++endif() # host unit tests
+ 
+ # EXPERIMENTAL second binary — G-Diffuser-JP (VERSION_JP profile).
+ # The port is US-only in three compile-time layers (binding tables, golden constants, VERSION_JP
+diff --git a/port/decomp_port.c b/port/decomp_port.c
+index dc07873..d7a9ab0 100644
+--- a/port/decomp_port.c
++++ b/port/decomp_port.c
+@@ -122,6 +122,13 @@ void gdx_rdram_init(void) {
+     gdx_register_host_range(gdx_rdram, GDX_RDRAM_SIZE);
+     gdx_register_host_range(&D_1000000, sizeof(D_1000000));
+     gdx_register_host_range(D_8024DCE0, sizeof(D_8024DCE0));
++#if defined(__ORBIS__) || defined(GDX_LOW_IMAGE)
++    /* Segment 2's storage (camera/scene matrices, see Gdx_ResolvePortAddress's unk_bss_segment
++       binding). Below 4 GiB its N64 addresses (0x02000000 + offset) are also image addresses, and
++       the bridge tells the two apart by the segment's exact extent -- which this registration
++       provides. Without it the race camera matrix was read from .rodata at 0x02000000. */
++    gdx_register_host_range(&D_80225800, sizeof(D_80225800));
++#endif
+     // The audio heap arena: every AudioHeap_Alloc* pool (including the aiBuffers the
+     // audio HLE's A_LOADBUFF/A_SAVEBUFF ops address by truncated low32) carves from
+     // this BSS block. It was never registered — on Windows the module-range
+@@ -541,6 +548,7 @@ static void* Gdx_ResolvePortAddress(uintptr_t addr) {
+         return (void*)addr;
+     }
+ 
++
+     raw = (unsigned int)addr;
+ 
+     /* LinkStubs.c can only provide a one-byte marker for the original linker
+@@ -557,6 +565,30 @@ static void* Gdx_ResolvePortAddress(uintptr_t addr) {
+         return resolved;
+     }
+ 
++#if defined(__ORBIS__) || defined(GDX_LOW_IMAGE)
++    /* Below 4 GiB (PS4 eboot at 0x400000) a real pointer into the image -- &D_1000000, the gfx
++       pools, decomp .data/.bss objects -- has a zero high half, so the branch above never sees it
++       and the low32 guesses below can land it on a different object: Segment_SetAddress(1,
++       &D_1000000) pointed segment 1 at an unrelated BSS block, every segment-1 matrix (camera,
++       effects) read garbage, and the booster flame / pit force field drew billions of units away.
++       Give image pointers the same treatment as wide ones, except values that are exactly an
++       asset's N64 segment address (those keep their segment meaning below). */
++    {
++        extern int gdx_main_image_contains(uintptr_t v);
++        extern int gdx_is_asset_segment_address_exact(unsigned int raw);
++        extern void* gdx_resolve_wide_asset_pointer(const void* full);
++        if (gdx_main_image_contains(addr) && !gdx_is_asset_segment_address_exact((unsigned int)addr)) {
++            void* imageAsset = gdx_resolve_wide_asset_pointer((const void*)addr);
++            if (resolveLogs < 12) {
++                resolveLogs++;
++                gdx_addr_log(imageAsset != NULL ? "image-asset" : "image", addr,
++                             imageAsset != NULL ? imageAsset : (void*)addr);
++            }
++            return imageAsset != NULL ? imageAsset : (void*)addr;
++        }
++    }
++#endif
++
+     assetBase = gdx_ensure_asset_segment_for_symbol(raw, &assetOffset);
+     if (assetBase != NULL) {
+         void* resolved = (u8*)assetBase + assetOffset;
+diff --git a/port/gdx_fiber_ps4.c b/port/gdx_fiber_ps4.c
+new file mode 100644
+index 0000000..e7b9024
+--- /dev/null
++++ b/port/gdx_fiber_ps4.c
+@@ -0,0 +1,147 @@
++/* port/gdx_fiber_ps4.c -- PS4 fiber backend for gdx_fiber.h.
++ *
++ * The OpenOrbis C library is musl, which has no getcontext/makecontext/swapcontext, so this is
++ * the "~40-line x86-64 asm switch behind this same API" that gdx_fiber_ucontext.c names as its
++ * escape hatch. The PS4 kernel uses the System V AMD64 ABI, so a switch saves the callee-saved
++ * registers (rbx, rbp, r12-r15), the SSE control word (MXCSR) and the x87 control word on the
++ * outgoing stack, stores rsp in the outgoing fiber and loads the incoming one. No signal mask is
++ * involved, unlike swapcontext.
++ *
++ * Stacks come from the heap (aligned_alloc). No guard page: mprotect on heap memory is not
++ * dependable on the PS4, and a guard page is only a diagnostic aid. The default stack is 1 MB,
++ * like the other backends.
++ */
++#include "gdx_fiber.h"
++
++#include <stdint.h>
++#include <stdlib.h>
++#include <string.h>
++#include <pthread.h>
++
++struct GdxFiber {
++    void*         sp;     /* saved stack pointer while not running */
++    void*         stack;  /* heap stack; NULL for the converted host thread */
++    GdxFiberEntry entry;
++    void*         arg;
++};
++
++static __thread GdxFiber* sCurrent = NULL;
++
++/* gdx_ps4_fiber_swap(void** save_sp, void* load_sp): save the running context on its stack and
++ * resume the one whose stack pointer is load_sp. Layout from the top of a saved stack:
++ * return address, rbp, rbx, r12, r13, r14, r15, then 8 bytes holding MXCSR (low 4) and the x87
++ * control word (next 2). */
++void gdx_ps4_fiber_swap(void** save_sp, void* load_sp);
++__asm__(
++    ".text\n"
++    ".globl gdx_ps4_fiber_swap\n"
++    ".type gdx_ps4_fiber_swap,@function\n"
++    "gdx_ps4_fiber_swap:\n"
++    "    pushq %rbp\n"
++    "    pushq %rbx\n"
++    "    pushq %r12\n"
++    "    pushq %r13\n"
++    "    pushq %r14\n"
++    "    pushq %r15\n"
++    "    subq $8, %rsp\n"
++    "    stmxcsr (%rsp)\n"
++    "    fnstcw 4(%rsp)\n"
++    "    movq %rsp, (%rdi)\n"
++    "    movq %rsi, %rsp\n"
++    "    ldmxcsr (%rsp)\n"
++    "    fldcw 4(%rsp)\n"
++    "    addq $8, %rsp\n"
++    "    popq %r15\n"
++    "    popq %r14\n"
++    "    popq %r13\n"
++    "    popq %r12\n"
++    "    popq %rbx\n"
++    "    popq %rbp\n"
++    "    ret\n"
++    ".size gdx_ps4_fiber_swap, .-gdx_ps4_fiber_swap\n");
++
++/* First code a new fiber runs: gdx_ps4_fiber_swap "returns" here with rsp 16-byte aligned, the
++ * state a function sees right before a call. The entry is not expected to return (the decomp
++ * threads end in __osCleanupThread, which reschedules), so returning aborts, as the ucontext
++ * backend does. */
++static void gdx_ps4_fiber_start(void) {
++    GdxFiber* f = sCurrent;
++    f->entry(f->arg);
++    abort();
++}
++
++/* Pushes the trampoline's return address after the stack pointer is aligned, so the trampoline
++ * starts with rsp % 16 == 8, exactly as after a call instruction. */
++void gdx_ps4_fiber_boot(void);
++__asm__(
++    ".text\n"
++    ".globl gdx_ps4_fiber_boot\n"
++    ".type gdx_ps4_fiber_boot,@function\n"
++    "gdx_ps4_fiber_boot:\n"
++    "    andq $-16, %rsp\n"
++    "    callq *%rbx\n"
++    "    ud2\n"
++    ".size gdx_ps4_fiber_boot, .-gdx_ps4_fiber_boot\n");
++
++GdxFiber* gdx_fiber_convert_thread(void) {
++    GdxFiber* f = (GdxFiber*) calloc(1, sizeof(*f));
++    if (f == NULL) {
++        return NULL;
++    }
++    sCurrent = f; /* the calling thread IS this context right now */
++    return f;
++}
++
++GdxFiber* gdx_fiber_create(GdxFiberEntry entry, void* arg, size_t stackSize) {
++    GdxFiber* f;
++    uint64_t* top;
++    uint32_t mxcsr;
++    uint16_t fpucw;
++
++    if (stackSize == 0) {
++        stackSize = 1024u * 1024u; /* 1 MB default, matching the other backends */
++    }
++    stackSize = (stackSize + 63u) & ~(size_t) 63u;
++
++    f = (GdxFiber*) calloc(1, sizeof(*f));
++    if (f == NULL) {
++        return NULL;
++    }
++    f->stack = aligned_alloc(64, stackSize);
++    if (f->stack == NULL) {
++        free(f);
++        return NULL;
++    }
++    f->entry = entry;
++    f->arg = arg;
++
++    /* A frame shaped like one gdx_ps4_fiber_swap saved: it "returns" into gdx_ps4_fiber_boot
++     * with rbx = the C trampoline. The new fiber inherits the creator's FP control state. */
++    __asm__ volatile("stmxcsr %0" : "=m"(mxcsr));
++    __asm__ volatile("fnstcw %0" : "=m"(fpucw));
++    top = (uint64_t*) ((char*) f->stack + stackSize);
++    *--top = 0;                                /* padding: keeps the frame 16-byte aligned */
++    *--top = (uint64_t) (uintptr_t) gdx_ps4_fiber_boot; /* return address */
++    *--top = 0;                                /* rbp */
++    *--top = (uint64_t) (uintptr_t) gdx_ps4_fiber_start; /* rbx */
++    *--top = 0;                                /* r12 */
++    *--top = 0;                                /* r13 */
++    *--top = 0;                                /* r14 */
++    *--top = 0;                                /* r15 */
++    *--top = (uint64_t) mxcsr | ((uint64_t) fpucw << 32);
++    f->sp = top;
++    return f;
++}
++
++void gdx_fiber_switch(GdxFiber* to) {
++    GdxFiber* from = sCurrent;
++    if (to == from) {
++        return;
++    }
++    sCurrent = to;
++    gdx_ps4_fiber_swap(&from->sp, to->sp);
++}
++
++unsigned long gdx_fiber_current_thread_id(void) {
++    return (unsigned long) (uintptr_t) pthread_self();
++}
+diff --git a/port/gdx_firstboot.cpp b/port/gdx_firstboot.cpp
+index dc48dab..b190679 100644
+--- a/port/gdx_firstboot.cpp
++++ b/port/gdx_firstboot.cpp
+@@ -142,6 +142,10 @@ const char* const kRomDevCandidates[] = { "baserom.us.rev0.z64", "baserom.pal.re
+ 
+ fs::path executableDir(const char* argv0) {
+     std::error_code ec;
++#ifdef __ORBIS__
++    // The eboot lives in read-only /app0; the game folder is /data/gdiffuser (ps4_platform.cpp).
++    return fs::path("/data/gdiffuser");
++#endif
+ #ifdef _WIN32
+     wchar_t buf[MAX_PATH] = {};
+     DWORD n = GetModuleFileNameW(nullptr, buf, MAX_PATH);
+diff --git a/port/gdx_gui.cpp b/port/gdx_gui.cpp
+index b4af69a..9c8bcd6 100644
+--- a/port/gdx_gui.cpp
++++ b/port/gdx_gui.cpp
+@@ -13,6 +13,7 @@ namespace {
+ ImFont* sFontStandard = nullptr;
+ ImFont* sFontLarge = nullptr;
+ ImFont* sFontMono = nullptr;
++ImFont* sFontQuickMenu = nullptr; // PS4 quick menu (port/ps4/quick_menu.cpp): drawn at ~20-40 px
+ 
+ ImFont* LoadFontWithIcons(const std::string& path, float size) {
+     ImGuiIO& io = ImGui::GetIO();
+@@ -46,6 +47,9 @@ void GdxFast3dGui::ImGuiWMInit() {
+     sFontStandard = LoadFontWithIcons(fontRoot + "Montserrat-Regular.ttf", 18.0f);
+     sFontLarge = LoadFontWithIcons(fontRoot + "Montserrat-Regular.ttf", 22.0f);
+     sFontMono = LoadFontWithIcons(fontRoot + "Inconsolata-Regular.ttf", 17.0f);
++#ifdef __ORBIS__
++    sFontQuickMenu = LoadFontWithIcons(fontRoot + "Montserrat-Regular.ttf", 42.0f);
++#endif
+ 
+     // Missing loose assets must never block boot. ImGui's default font already includes Font
+     // Awesome through libultraship, so it is a complete fallback.
+@@ -83,3 +87,7 @@ ImFont* GdxGuiFontLarge() {
+ ImFont* GdxGuiFontMono() {
+     return sFontMono;
+ }
++
++ImFont* GdxGuiFontQuickMenu() {
++    return sFontQuickMenu != nullptr ? sFontQuickMenu : sFontLarge;
++}
+diff --git a/port/gdx_gui.h b/port/gdx_gui.h
+index aa01295..fc9e1f8 100644
+--- a/port/gdx_gui.h
++++ b/port/gdx_gui.h
+@@ -20,3 +20,5 @@ class GdxFast3dGui final : public Fast::Fast3dGui {
+ ImFont* GdxGuiFontStandard();
+ ImFont* GdxGuiFontLarge();
+ ImFont* GdxGuiFontMono();
++// The PS4 quick menu's large font (falls back to the large one elsewhere).
++ImFont* GdxGuiFontQuickMenu();
+diff --git a/port/gdx_imgui_nav.cpp b/port/gdx_imgui_nav.cpp
+index 14f62c5..0c3ec4a 100644
+--- a/port/gdx_imgui_nav.cpp
++++ b/port/gdx_imgui_nav.cpp
+@@ -114,8 +114,12 @@ extern "C" void gdx_imgui_nav_tick(void) {
+     // Read by libultraship's Gui toggle even while the menu is closed, so these stay fed
+     // unconditionally: Back is the pad's only path to OPEN the menu (CanUseGamepadNavigation is
+     // false while it is hidden).
++#ifndef __ORBIS__
++    // PS4: the touchpad (Back) belongs to the quick menu (port/ps4/quick_menu.cpp), which also
++    // closes this menu, and Options (Start) to the game.
+     FeedButton(io, c, SDL_CONTROLLER_BUTTON_BACK, ImGuiKey_GamepadBack);
+     FeedButton(io, c, SDL_CONTROLLER_BUTTON_START, ImGuiKey_GamepadStart);
++#endif
+ 
+     // Honor the nav block (input-editor capture popup sets it): while navigation is disallowed a
+     // face-button press must reach only the raw capture, never ImGui activation — otherwise the
+diff --git a/port/gdx_lowimage_win.cpp b/port/gdx_lowimage_win.cpp
+new file mode 100644
+index 0000000..0002b23
+--- /dev/null
++++ b/port/gdx_lowimage_win.cpp
+@@ -0,0 +1,50 @@
++// port/gdx_lowimage_win.cpp -- GDX_LOW_IMAGE Windows test build only.
++//
++// Reproduces the PS4's address layout on a PC: the executable is linked at /BASE:0x400000 with
++// ASLR off (port/CMakeLists.txt), so its .data/.bss addresses fit in 32 bits and overlap N64
++// segment addresses 0x01xxxxxx-0x04xxxxxx exactly as the PS4 eboot's do, while every heap
++// allocation stays above 4 GiB like the PS4's dlmalloc heap (0x1040000000). The second half is
++// done here: before ordinary static constructors run, every free range below 4 GiB is reserved, so
++// later VirtualAlloc/HeapAlloc growth can only land above it. The bridge's GDX_IMAGE_BELOW_4G
++// fixes then run on Windows with the D3D11 renderer, which separates address bugs from the PS4
++// Vulkan backend.
++#if defined(_WIN32) && defined(GDX_LOW_IMAGE)
++#ifndef NOMINMAX
++#define NOMINMAX
++#endif
++#include <windows.h>
++#include <cstdint>
++#include <cstdio>
++
++#pragma warning(disable : 4073)
++#pragma init_seg(lib)
++
++namespace {
++struct ReserveLowAddressSpace {
++    ReserveLowAddressSpace() {
++        MEMORY_BASIC_INFORMATION mbi;
++        uintptr_t addr = 0x10000;
++        unsigned long long reserved = 0;
++        while (addr < 0x100000000ull && VirtualQuery(reinterpret_cast<void*>(addr), &mbi, sizeof(mbi)) != 0) {
++            const uintptr_t base = reinterpret_cast<uintptr_t>(mbi.BaseAddress);
++            const uintptr_t end = base + mbi.RegionSize;
++            if (mbi.State == MEM_FREE) {
++                const uintptr_t a = (base + 0xFFFF) & ~static_cast<uintptr_t>(0xFFFF); // allocation granularity
++                const uintptr_t e = end < 0x100000000ull ? end : 0x100000000ull;
++                if (e > a && VirtualAlloc(reinterpret_cast<void*>(a), e - a, MEM_RESERVE, PAGE_NOACCESS) != nullptr) {
++                    reserved += e - a;
++                }
++            }
++            if (end <= addr) {
++                break;
++            }
++            addr = end;
++        }
++        char line[128];
++        snprintf(line, sizeof(line), "[lowimage] image at %p, reserved %llu MiB below 4 GiB\n",
++                 static_cast<void*>(GetModuleHandleA(nullptr)), reserved >> 20);
++        OutputDebugStringA(line);
++    }
++} sReserveLowAddressSpace;
++} // namespace
++#endif
+diff --git a/port/gdx_menu.cpp b/port/gdx_menu.cpp
+index ae78819..593afab 100644
+--- a/port/gdx_menu.cpp
++++ b/port/gdx_menu.cpp
+@@ -506,6 +506,15 @@ GdxMenu::GdxMenu() : Ship::GuiWindow("gOpenMenuBar", false, "G-Diffuser Menu") {
+     CVarRegisterInteger("gEnhancements.Graphics.HideRaceCurtain", 0);
+     CVarRegisterInteger("gEnhancements.Graphics.CourseSelectClipOffscreen", 1);
+     CVarRegisterInteger("gEnhancements.Graphics.RemoveBorders", 0);
++#ifdef __ORBIS__
++    // PS4: the CRT-overscan frame shows as a black border on a TV through VideoOut; fill the whole
++    // 16:9 screen by default (once: the quick menu's Remove Black Borders still turns it back).
++    if (CVarGetInteger("gdx.Migrations.Ps4RemoveBordersDefaultOn", 0) == 0) {
++        CVarSetInteger("gdx.Migrations.Ps4RemoveBordersDefaultOn", 1);
++        CVarSetInteger("gEnhancements.Graphics.RemoveBorders", 1);
++        CVarSave();
++    }
++#endif
+     // CRTShader is read live per frame by the interpreter's StartFrame latch and forces the
+     // offscreen render path when on, so a plain write takes effect on the next frame.
+     CVarRegisterInteger("gEnhancements.Graphics.CRTShader", 0);
+@@ -2504,3 +2513,64 @@ void GdxMenu::DrawCourseEditKeybinds(GdxUI::WidgetInfo& widget) {
+         ImGui::EndDisabled();
+     }
+ }
++
++#ifdef __ORBIS__
++std::vector<GdxMenu::QuickPage> GdxMenu::QuickMenuPages(const std::vector<std::string>& sections) {
++    if (!mRegistered) {
++        mRegistered = true;
++        RegisterDisableReasons();
++        RegisterMenu();
++    }
++    std::vector<QuickPage> pages;
++    for (const std::string& section : sections) {
++        auto sectionIt = mMenuEntries.find(section);
++        if (sectionIt == mMenuEntries.end()) {
++            continue;
++        }
++        for (const std::string& sidebar : sectionIt->second.sidebarOrder) {
++            auto sidebarIt = sectionIt->second.sidebars.find(sidebar);
++            if (sidebarIt == sectionIt->second.sidebars.end()) {
++                continue;
++            }
++            QuickPage page{ section, sidebar, {} };
++            for (auto& column : sidebarIt->second.columnWidgets) {
++                for (GdxUI::WidgetInfo& widget : column) {
++                    page.widgets.push_back(&widget);
++                }
++            }
++            pages.push_back(std::move(page));
++        }
++    }
++    return pages;
++}
++
++void GdxMenu::QuickMenuEvaluate() {
++    for (GdxUI::DisabledInfo& info : mDisabledInfo) {
++        if (info.evaluation != nullptr) {
++            info.active = info.evaluation(info);
++        }
++    }
++}
++
++bool GdxMenu::QuickMenuHidden(GdxUI::WidgetInfo& widget) {
++    widget.ResetDisables();
++    for (GdxUI::DisableOption reason : widget.hideWhen) {
++        if (reason < mDisabledInfo.size() && mDisabledInfo[reason].active) {
++            widget.isHidden = true;
++        }
++    }
++    if (widget.preFunc != nullptr) {
++        widget.preFunc(widget);
++    }
++    return widget.isHidden;
++}
++
++bool GdxMenu::QuickMenuDisabled(const GdxUI::WidgetInfo& widget) const {
++    for (GdxUI::DisableOption reason : widget.disableWhen) {
++        if (reason < mDisabledInfo.size() && mDisabledInfo[reason].active) {
++            return true;
++        }
++    }
++    return widget.options != nullptr && widget.options->disabled;
++}
++#endif
+diff --git a/port/gdx_menu.h b/port/gdx_menu.h
+index 2c52d89..b952d94 100644
+--- a/port/gdx_menu.h
++++ b/port/gdx_menu.h
+@@ -30,6 +30,22 @@ class GdxMenu final : public Ship::GuiWindow {
+     void Draw() override;
+     void DrawElement() override;
+ 
++#ifdef __ORBIS__
++    // ── PS4 quick menu (port/ps4/quick_menu.cpp) ────────────────────────────────────────────
++    // The console has no full-screen menu: the quick menu lists the same registry as pad-driven
++    // pages. These read and run it exactly as MenuDrawItem does, without drawing the shell.
++    struct QuickPage {
++        std::string section, sidebar;
++        std::vector<GdxUI::WidgetInfo*> widgets; // every column, in order; stable after registration
++    };
++    std::vector<QuickPage> QuickMenuPages(const std::vector<std::string>& sections);
++    // Once per frame before the queries below: the disable/hide reasons (DrawElement's cache).
++    void QuickMenuEvaluate();
++    // hideWhen + preFunc (which also refreshes a non-CVar widget's valuePointer).
++    bool QuickMenuHidden(GdxUI::WidgetInfo& widget);
++    bool QuickMenuDisabled(const GdxUI::WidgetInfo& widget) const;
++#endif
++
+   protected:
+     void InitElement() override;
+     void UpdateElement() override;
+diff --git a/port/gdx_menu_registry.cpp b/port/gdx_menu_registry.cpp
+index 8dd0023..1ab0acf 100644
+--- a/port/gdx_menu_registry.cpp
++++ b/port/gdx_menu_registry.cpp
+@@ -1121,6 +1121,33 @@ void GdxMenu::RegisterMenu() {
+                   })
+                   .SearchTerms("supersampling render scale sharpness upscale"));
+ 
++#ifdef __ORBIS__
++    // PS4: FSR 1.0 (EASU + RCAS) in the Vulkan backend (libultraship gfx_vulkan.cpp GdxFsrUpscale).
++    // A mode picks the render scale and turns the upscaler on; Off goes back to native 1.00x.
++    AddWidget("Settings", "Graphics", SECTION_COLUMN_1,
++              WidgetInfo{ .name = "FSR 1.0 upscaling", .cVar = "gPs4.FsrMode", .type = GdxUI::WIDGET_CVAR_COMBOBOX }
++                  .ComboItems({ "Off (native)", "Ultra Quality (77%)", "Quality (67%)", "Balanced (59%)",
++                                "Performance (50%)" })
++                  .Options(UIWidgets::ComboboxOptions().DefaultIndex(0).Tooltip(
++                      "AMD FidelityFX Super Resolution 1.0: renders at a lower resolution and\n"
++                      "upscales with edge-aware filtering and sharpening. Frees GPU time."))
++                  .Callback([](WidgetInfo&) {
++                      static const float kScale[] = { 1.0f, 0.77f, 0.67f, 0.59f, 0.50f };
++                      const int mode = std::clamp(CVarGetInteger("gPs4.FsrMode", 0), 0, 4);
++                      CVarSetFloat("gInternalResolution", kScale[mode]);
++                      CVarSave();
++                      if (auto window = GdxWindow()) {
++                          window->SetResolutionMultiplier(kScale[mode]);
++                      }
++                  })
++                  .SearchTerms("fsr amd fidelityfx super resolution upscale"));
++    AddWidget("Settings", "Graphics", SECTION_COLUMN_1,
++              WidgetInfo{ .name = "FSR sharpness", .cVar = "gPs4.FsrSharpness", .type = GdxUI::WIDGET_CVAR_SLIDER_INT }
++                  .Options(UIWidgets::IntSliderOptions().Min(0).Max(10).Step(1).DefaultValue(8).Tooltip(
++                      "RCAS sharpening after the FSR upscale. 10 is sharpest."))
++                  .SearchTerms("fsr rcas sharpen"));
++#endif
++
+     // NOT a CVar-bound combobox: gMSAAValue stores the SAMPLE COUNT, not the list index, so the
+     // mapping is explicit. The vector overload keeps the rows in declared order; the unordered_map
+     // one would scramble them (UIWidgets.hpp's gap list).
+diff --git a/port/gen/AssetBindings.c b/port/gen/AssetBindings.c
+index f9859a2..d377187 100644
+--- a/port/gen/AssetBindings.c
++++ b/port/gen/AssetBindings.c
+@@ -9282,3 +9282,47 @@ const GdxSegmentBlobEntry* gdx_lookup_segment_blob(unsigned int rom_base, unsign
+     return NULL;
+ }
+ #endif /* PORT */
++
++#if defined(__ORBIS__) || defined(GDX_LOW_IMAGE)
++/* PS4 (port/n64_gfx_bridge.cpp, ProcessList): the reverse of gdx_lookup_asset_segment. Display
++ * lists carry assets both as placeholder symbols and as their original N64 segment addresses
++ * (0x03004618 = machine_custom_gfx/D_3004618). On PS4 the image sits below 4 GiB, so such a
++ * segment address can also be a valid image address (that one lands in gAudioHeap). Returns the
++ * placeholder holding segment address `raw` (symbol + interior offset), preferring an exact symbol
++ * start, or NULL when no asset row has that segment address. */
++void* gdx_asset_symbol_for_segment_address(unsigned int raw) {
++    const unsigned char seg = (unsigned char)(raw >> 24);
++    const unsigned int off = raw & 0x00FFFFFFu;
++    int i;
++    int interior = -1;
++    for (i = 0; sAssetSegmentMap[i].sym != NULL; i++) {
++        const GdxAssetSegmentEntry* e = &sAssetSegmentMap[i];
++        if (e->segment != seg || off < e->offset || off - e->offset >= e->sym_size) {
++            continue;
++        }
++        if (off == e->offset) {
++            return e->sym;
++        }
++        if (interior < 0) {
++            interior = i;
++        }
++    }
++    if (interior >= 0) {
++        return (unsigned char*)sAssetSegmentMap[interior].sym + (off - sAssetSegmentMap[interior].offset);
++    }
++    return NULL;
++}
++
++/* Exact form: only an asset's own start address counts (decomp_port.c Gdx_ResolvePortAddress). */
++int gdx_is_asset_segment_address_exact(unsigned int raw) {
++    const unsigned char seg = (unsigned char)(raw >> 24);
++    const unsigned int off = raw & 0x00FFFFFFu;
++    int i;
++    for (i = 0; sAssetSegmentMap[i].sym != NULL; i++) {
++        if (sAssetSegmentMap[i].segment == seg && sAssetSegmentMap[i].offset == off) {
++            return 1;
++        }
++    }
++    return 0;
++}
++#endif
+diff --git a/port/main.cpp b/port/main.cpp
+index e567ba8..88a65b2 100644
+--- a/port/main.cpp
++++ b/port/main.cpp
+@@ -663,6 +663,10 @@ static bool gdxIsO2rFile(const std::filesystem::path& p) {
+ static std::vector<std::string> findArchivePaths(const char* argv0) {
+     std::vector<std::filesystem::path> roots;
+     std::error_code ec;
++#ifdef __ORBIS__
++    // The game folder, by absolute path (argv[0] is in read-only /app0).
++    roots.push_back("/data/gdiffuser");
++#endif
+     addArchiveCandidateRoots(roots, std::filesystem::current_path(ec));
+     if (argv0 != nullptr) {
+         addArchiveCandidateRoots(roots, argv0);
+@@ -858,7 +862,18 @@ static std::vector<std::string> findArchivePaths(const char* argv0) {
+     return archives;
+ }
+ 
++#ifdef __ORBIS__
++extern "C" void gdx_ps4_prepare_data(void);     // port/ps4/ps4_platform.cpp
++extern "C" void gdx_ps4_init_controllers(void); // port/ps4/ps4_platform.cpp
++#include "ps4/quick_menu.h"
++#endif
++
+ int main(int argc, char** argv) {
++#ifdef __ORBIS__
++    // /data/gdiffuser is the game folder: the packaged game data is copied there and it becomes
++    // the working directory, before anything resolves a path.
++    gdx_ps4_prepare_data();
++#endif
+     // Must precede every log call this process makes. Precedence rules in port/gdx_dev_gates.h.
+     gdx_dev_gates_init_env();
+ 
+@@ -877,7 +892,19 @@ int main(int argc, char** argv) {
+     // a freshly extracted archive is picked up this same boot. Skipped on a development tree,
+     // where re-extraction would clobber the developer's working generic.o2r. Never blocks boot —
+     // on any failure the raw-ROM fallback carries the session.
++#ifdef __ORBIS__
++    // No extraction on the console (it runs gdx-extract as a child process): the package carries
++    // the archives the PC version built. Without them there is nothing to boot.
++    if (firstBoot.status == gdx::FirstBootStatus::NeedsSetup) {
++        gdx_port_logf("[G-Diffuser] PS4: the packaged game data is missing or does not verify "
++                      "(fzerox.o2r, fzerox-disk.o2r, n64ddipl.o2r and the state files in "
++                      "/data/gdiffuser); rebuild the package with scripts/package-gdx.sh.\n");
++        return 1;
++    }
++    if (false) {
++#else
+     if (firstBoot.status != gdx::FirstBootStatus::NeedsSetup) {
++#endif
+         std::error_code cwdEc;
+         const bool devTreeArchive = gdx::DevelopmentTreeProvidesArchive(
+             firstBoot.exeDir, std::filesystem::current_path(cwdEc).string());
+@@ -898,7 +925,14 @@ int main(int argc, char** argv) {
+     if (ctx == nullptr) { logStep("FATAL: CreateUninitializedInstance"); return 1; }
+ 
+     logStep("InitLogging");
++#ifdef __ORBIS__
++    // warnings and errors only, into boot-trace.log (libultraship Context.cpp Ps4TraceSink)
++    ctx->InitLogging(spdlog::level::warn, spdlog::level::warn, false);
++    SPDLOG_WARN("spdlog forwarding to boot-trace.log active");
++    if (false) {
++#else
+     if (gdx_log_file_enabled()) {
++#endif
+         ctx->InitLogging();
+     } else {
+         ctx->InitLogging(spdlog::level::off, spdlog::level::off, false);
+@@ -922,6 +956,9 @@ int main(int argc, char** argv) {
+     if (SDL_InitSubSystem(SDL_INIT_GAMECONTROLLER) != 0) {
+         gdx_port_logf("[input] SDL_InitSubSystem(GAMECONTROLLER) FAILED: %s\n", SDL_GetError());
+     } else {
++#ifdef __ORBIS__
++        gdx_ps4_init_controllers();
++#endif
+         gdx_port_logf("[input] SDL gamecontroller subsystem up; %d joystick(s) present at boot\n",
+                       SDL_NumJoysticks());
+         logConnectedJoysticks();
+@@ -1380,6 +1417,19 @@ int main(int argc, char** argv) {
+         // Course Edit / Create Machine render through the stock 4:3 pillarbox path.
+         gdx_fixed_aspect_tick();
+         gdx::PerfPhaseEnd(gdx::PerfInput);
++#ifdef __ORBIS__
++        // PS4 quick menu (port/ps4/quick_menu.cpp): while it is up the game does not tick; the
++        // menu is presented over the frame it captured when it opened.
++        if (GdxPs4QuickMenuUpdate()) {
++            w->GetGui()->StartDraw();
++            w->StartFrame();
++            GdxPs4QuickMenuDraw();
++            w->GetGui()->EndDraw();
++            w->EndFrame();
++            gdx::PerfFrameEnd();
++            continue;
++        }
++#endif
+ 
+         // The sub-frame schedule must be configured BEFORE gdx_vi_tick: the game's gfx-task
+         // submission (gdx_gfx_run) executes inside gdx_vi_tick's synchronous fiber dispatch, so the
+diff --git a/port/n64_gfx_bridge.cpp b/port/n64_gfx_bridge.cpp
+index db961c7..27b03e2 100644
+--- a/port/n64_gfx_bridge.cpp
++++ b/port/n64_gfx_bridge.cpp
+@@ -3,6 +3,36 @@
+ // which would double-wrap StartFrame/EndFrame.
+ // Must build into the G-Diffuser executable target only, never the gdiffuser_game OBJECT library.
+ 
++// The executable image lives below 4 GiB, so its own addresses can equal N64 segment addresses
++// (0x01xxxxxx-0x04xxxxxx): the PS4 eboot (0x400000), and the GDX_LOW_IMAGE Windows test build that
++// reproduces that layout on a PC. Address-disambiguation fixes key on this, console APIs on __ORBIS__.
++#if defined(__ORBIS__) || defined(GDX_LOW_IMAGE)
++#define GDX_IMAGE_BELOW_4G 1
++#endif
++#ifdef GDX_IMAGE_BELOW_4G
++#include <cstdlib>
++/* Each below-4-GiB address fix, switchable for bisecting in the GDX_LOW_IMAGE PC test build
++   (env GDX_LOWFIX = bit mask, default all on). The PS4 always runs all of them.
++     1 ProcessList: image-range pointer words are host pointers
++     2 ProcessList: asset segment addresses read through the live segment table
++     4 TryResolveAddress: segment branch refuses image addresses past the segment's buffer
++     8 TryResolveAddress: unowned image address used directly
++    16 ResolveGeneratedAssetStub: rejected placeholder read as segment address
++    32 TryResolveAddress: known placeholder never falls through to heuristics */
++static inline bool GdxLowFix(unsigned bit) {
++#ifdef __ORBIS__
++    (void) bit;
++    return true;
++#else
++    static const unsigned mask = [] {
++        const char* e = std::getenv("GDX_LOWFIX");
++        return e != nullptr ? static_cast<unsigned>(std::strtoul(e, nullptr, 0)) : 0xFFu;
++    }();
++    return (mask & bit) != 0;
++#endif
++}
++#endif
++
+ #ifdef _WIN32
+ #ifndef NOMINMAX
+ #define NOMINMAX
+@@ -17,6 +47,10 @@
+ #include <atomic>
+ #include <dlfcn.h>
+ #include <unistd.h>
++#ifdef __ORBIS__
++#include <iterator>
++#include <orbis/libkernel.h> // sceKernelVirtualQuery: the PS4 has no /proc/self/maps
++#endif
+ #endif
+ 
+ #include "ship/Context.h"
+@@ -230,6 +264,10 @@ extern "C" int gdx_mode_segment_content_matches(unsigned int seg, unsigned int r
+ extern "C" const char* GDiffuser_LookupLoadedAssetKey(const void* buffer, size_t minSize, int requireUnmodified);
+ extern "C" const char* GDiffuser_LookupLoadedAssetKeyAndSize(const void* buffer, size_t* outSize);
+ extern "C" const char* gdx_lookup_asset_segment_o2r_key(unsigned int sym_low32);
++#ifdef GDX_IMAGE_BELOW_4G
++extern "C" int gdx_lookup_asset_segment(unsigned int raw, unsigned char* segment, unsigned int* romBase,
++                                        unsigned char* compressed, unsigned int* offset, unsigned int* imageSize);
++#endif
+ // Workshop texture packs (port/gdx_workshop.cpp).
+ extern "C" int gdx_workshop_texture_packs_enabled(void);
+ extern "C" const char* GdxWorkshopLookupOverridePath(const char* key);
+@@ -855,6 +893,32 @@ bool LookupAssetSegment(uint32_t raw, AssetSegmentLookup& out) {
+  * pointer must go through TryResolveAddress -> ResolveGeneratedAssetStub and never be used
+  * verbatim. ProcessList uses this so a wide packet carrying a placeholder is not mistaken for a
+  * real host pointer just because its high32 is set. */
++#ifdef GDX_IMAGE_BELOW_4G
++extern "C" void* gdx_asset_symbol_for_segment_address(unsigned int raw);
++
++// Set by ProcessList for the command being translated when its word is an N64 segment address that
++// also falls inside the image: TryResolveAddress then reads it through the live segment table only.
++thread_local bool gImageTokenIsSegment = false;
++
++// Cached: ProcessList asks for every wide image-range word.
++uintptr_t Ps4AssetSymbolForSegmentAddress(uint32_t raw) {
++    const uint8_t seg = static_cast<uint8_t>(raw >> 24);
++    if (seg == 0 || seg >= 16) {
++        return 0;
++    }
++    static std::unordered_map<uint32_t, uintptr_t> sCache;
++    static std::mutex sMutex;
++    std::lock_guard<std::mutex> lock(sMutex);
++    auto it = sCache.find(raw);
++    if (it != sCache.end()) {
++        return it->second;
++    }
++    const uintptr_t sym = reinterpret_cast<uintptr_t>(gdx_asset_symbol_for_segment_address(raw));
++    sCache.emplace(raw, sym);
++    return sym;
++}
++#endif
++
+ bool IsAssetPlaceholderPointer(uint32_t low32) {
+     AssetSegmentLookup scratch = {};
+     return LookupAssetSegment(low32, scratch);
+@@ -1457,12 +1521,42 @@ bool ResolveGeneratedAssetStub(uint32_t raw, ResolvedAddress& out, size_t requir
+             out.segmented = true;
+             return true;
+         }
++#ifdef GDX_IMAGE_BELOW_4G
++        /* PS4: the image holds placeholder symbols at 0x03xxxxxx-0x040Exxxx, so a genuine segment
++           address can land inside a placeholder's image span. The race HUD's digit textures
++           (0x04001CA8..0x04006EA8, hud_gfx in segment 4) matched an expansion-kit seg-7
++           placeholder whose family is not resident and were rejected here -- garbled TIME/speed.
++           A value this path turns down is read as the segment address it also is. */
+         {
++            const uint8_t seg = static_cast<uint8_t>(raw >> 24);
++            const uint32_t segOffset = raw & 0x00FFFFFFu;
++            if (GdxLowFix(16) && seg >= 1 && seg < kGfxSegmentCount && gSegments[seg] != 0 &&
++                segOffset < kSegmentOffsetLimit && ReadableByteLimit(gSegments[seg] + segOffset) >= requiredBytes) {
++                out.full = gSegments[seg] + segOffset;
++                out.segment = seg;
++                out.offset = segOffset;
++                out.segmented = true;
++                return true;
++            }
++        }
++#endif
++        {
++            static uint32_t sE2Seen[64];
+             static int sE2RejectLogs = 0;
+-            if (sE2RejectLogs < 16) {
+-                ++sE2RejectLogs;
+-                gdx_port_logf("[e2-reject] seg=%u off=%X req=%zu mode-owned, live fallback unavailable\n",
+-                              static_cast<unsigned>(lookup.segment), lookup.offset, requiredBytes);
++            const uint32_t key = (static_cast<uint32_t>(lookup.segment) << 24) | (lookup.offset & 0xFFFFFFu);
++            bool seen = false;
++            for (int k = 0; k < sE2RejectLogs && !seen; k++) {
++                seen = sE2Seen[k] == key;
++            }
++            if (!seen && sE2RejectLogs < 64) {
++                sE2Seen[sE2RejectLogs++] = key;
++                gdx_port_logf("[e2-reject] seg=%u off=%X req=%zu mode-owned, live fallback unavailable "
++                              "(raw=%08X live=%p familyMatch=%d romBase=%08X readable=0x%zx)\n",
++                              static_cast<unsigned>(lookup.segment), lookup.offset, requiredBytes, raw,
++                              reinterpret_cast<void*>(live),
++                              gdx_mode_segment_content_matches(lookup.segment, lookup.romBase),
++                              static_cast<unsigned>(lookup.romBase),
++                              live != 0 ? ReadableByteLimit(live + lookup.offset) : static_cast<size_t>(0));
+             }
+         }
+         return false;
+@@ -1978,6 +2072,54 @@ static const MapsRegion* FindMapsRegion(uintptr_t addr) {
+     return nullptr;
+ }
+ 
++#ifdef __ORBIS__
++// PS4: no /proc. sceKernelVirtualQuery describes the mapping containing an address (flags 0);
++// a readable run is followed forward through adjacent mappings, like the coalesced maps above,
++// and cached in sMaps (sorted). Mappings this port uses are not unmapped while it runs.
++static bool Ps4QueryRegion(uintptr_t addr, MapsRegion& out) {
++    OrbisKernelVirtualQueryInfo info;
++    std::memset(&info, 0, sizeof(info));
++    if (sceKernelVirtualQuery(reinterpret_cast<const void*>(addr), 0, &info, sizeof(info)) < 0) {
++        return false;
++    }
++    out.begin = reinterpret_cast<uintptr_t>(info.unk01); // start
++    out.end = reinterpret_cast<uintptr_t>(info.unk02);   // end
++    out.readable = (info.unk04 & ORBIS_KERNEL_PROT_CPU_READ) != 0; // protection
++    return out.end > out.begin && addr >= out.begin && addr < out.end;
++}
++
++static bool PosixRegionFor(uintptr_t addr, MapsRegion& out) {
++    if (const MapsRegion* cached = FindMapsRegion(addr)) {
++        out = *cached;
++        return true;
++    }
++    MapsRegion r;
++    if (!Ps4QueryRegion(addr, r)) {
++        return false;
++    }
++    for (int i = 0; r.readable && i < 256; i++) {
++        MapsRegion next;
++        if (!Ps4QueryRegion(r.end, next) || !next.readable || next.begin != r.end) {
++            break;
++        }
++        r.end = next.end;
++    }
++    auto at = std::lower_bound(sMaps.begin(), sMaps.end(), r.begin,
++                               [](const MapsRegion& m, uintptr_t b) { return m.begin < b; });
++    // Drop cached entries the new run covers, so the vector stays sorted and disjoint.
++    auto last = at;
++    while (last != sMaps.end() && last->begin < r.end) {
++        ++last;
++    }
++    at = sMaps.erase(at, last);
++    if (at != sMaps.begin() && std::prev(at)->end > r.begin) {
++        std::prev(at)->end = r.begin;
++    }
++    sMaps.insert(at, r);
++    out = r;
++    return true;
++}
++#else
+ // Copies the region out by value: a subsequent probe can re-parse and reallocate sMaps.
+ static bool PosixRegionFor(uintptr_t addr, MapsRegion& out) {
+     if (sMaps.empty()) {
+@@ -1994,6 +2136,14 @@ static bool PosixRegionFor(uintptr_t addr, MapsRegion& out) {
+     out = *r;
+     return true;
+ }
++#endif // __ORBIS__
++#endif
++
++#ifdef __ORBIS__
++extern "C" char __text_start[]; // OpenOrbis link.x
++extern "C" char _end[];         // lld: end of the image
++static char* const gdx_ps4_text_start = __text_start;
++static char* const gdx_ps4_image_end = _end;
+ #endif
+ 
+ void GetMainModuleRange(uintptr_t& moduleBegin, uintptr_t& moduleEnd) {
+@@ -2019,6 +2169,11 @@ void GetMainModuleRange(uintptr_t& moduleBegin, uintptr_t& moduleEnd) {
+ 
+     moduleBegin = reinterpret_cast<uintptr_t>(module);
+     moduleEnd = moduleBegin + ntHeaders->OptionalHeader.SizeOfImage;
++#elif defined(__ORBIS__)
++    // PS4: no /proc or dladdr. The OpenOrbis linker script starts the image at __text_start, and
++    // lld defines _end after the last section (.bss).
++    moduleBegin = reinterpret_cast<uintptr_t>(gdx_ps4_text_start);
++    moduleEnd = reinterpret_cast<uintptr_t>(gdx_ps4_image_end);
+ #else
+     // Mirror "module base + SizeOfImage": take the contiguous run of /proc/self/maps entries whose
+     // pathname is the main executable, using begin-of-first .. end-of-last. dladdr on a local
+@@ -4172,11 +4327,104 @@ class N64DisplayListAdapter {
+         return limit;
+     }
+ 
++#ifdef GDX_IMAGE_BELOW_4G
++    /* PS4: the eboot is mapped at 0x400000, so a pointer into the image's own data (.rodata,
++       .data, the .bss arenas and buffers) has the same 32-bit value as an N64 segment address
++       0x01xxxxxx..0x04xxxxxx. On Windows the image sits above 4 GiB and the two never meet; here
++       the segment reading wins first and, since the 512 MiB dlmalloc heap is one readable block,
++       its readability gate passes and the texture/vertices come from the wrong place (cars,
++       shadows, HUD digits). A segment address can only reach as far as its own buffer, though:
++       the smallest registered host range holding the segment base gives that buffer's end.
++       Returns true when `raw` is an image address that cannot be that segment. */
++    bool Ps4ImagePointerNotSegment(uint32_t raw, uint8_t seg, uint32_t segOffset, size_t requiredBytes,
++                                   const char* branch) const {
++        if (mModuleBegin == 0 || raw < mModuleBegin || raw >= mModuleEnd || seg >= kGfxSegmentCount) {
++            return false;
++        }
++        const uintptr_t base = gSegments[seg];
++        size_t extent = 0;
++        for (const HostRange& range : gHostRanges) {
++            // 1-byte placeholder stubs (hostrange rows of size 1) are not buffers a segment spans
++            if (range.size < 0x100 || base < range.begin || base - range.begin >= range.size) {
++                continue;
++            }
++            const size_t left = range.size - (base - range.begin);
++            if (extent == 0 || left < extent) {
++                extent = left;
++            }
++        }
++        const bool outside = extent != 0 && (segOffset >= extent || requiredBytes > extent - segOffset);
++        return outside;
++    }
++#endif
++
++#ifdef GDX_IMAGE_BELOW_4G
++    // The segment's buffer (smallest registered host range holding its base) covers offset+need.
++    bool Ps4SegmentFits(uint8_t seg, uint32_t segOffset, size_t requiredBytes) const {
++        const uintptr_t base = gSegments[seg];
++        size_t extent = 0;
++        for (const HostRange& range : gHostRanges) {
++            if (range.size < 0x100 || base < range.begin || base - range.begin >= range.size) {
++                continue;
++            }
++            const size_t left = range.size - (base - range.begin);
++            if (extent == 0 || left < extent) {
++                extent = left;
++            }
++        }
++        return extent != 0 && segOffset < extent && requiredBytes <= extent - segOffset &&
++               ReadableByteLimit(base + segOffset) >= requiredBytes;
++    }
++#endif
++
++#ifdef GDX_IMAGE_BELOW_4G
++    /* Like Ps4SegmentFits, but only for a segment whose buffer size is known exactly: its base
++       must sit in a registered buffer other than the whole image or the 16 MiB RDRAM block (those
++       say nothing about where the segment ends). An N64 segment offset is also < 8 MiB. */
++    bool Ps4SegmentExactFits(uint8_t seg, uint32_t segOffset, size_t requiredBytes) const {
++        if (seg == 0 || seg >= kGfxSegmentCount || gSegments[seg] == 0 || segOffset >= 0x800000u) {
++            return false;
++        }
++        const uintptr_t base = gSegments[seg];
++        if (IsRdramHostPointer(base)) {
++            return false;
++        }
++        size_t extent = 0;
++        for (const HostRange& range : gHostRanges) {
++            if (range.size < 0x100 || base < range.begin || base - range.begin >= range.size) {
++                continue;
++            }
++            if (range.begin == mModuleBegin && range.size == mModuleEnd - mModuleBegin) {
++                continue; // the whole image
++            }
++            const size_t left = range.size - (base - range.begin);
++            if (extent == 0 || left < extent) {
++                extent = left;
++            }
++        }
++        return extent != 0 && segOffset < extent && requiredBytes <= extent - segOffset;
++    }
++#endif
++
+     bool TryResolveAddress(uint32_t raw, ResolvedAddress& out, size_t requiredBytes = 1, bool preferPhysical = false,
+                            uintptr_t sourceHint = 0) const {
+         if (raw == 0) {
+             return false;
+         }
++#ifdef GDX_IMAGE_BELOW_4G
++        if (gImageTokenIsSegment) {
++            const uint8_t seg = static_cast<uint8_t>(raw >> 24);
++            const uint32_t segOffset = raw & 0x00FFFFFFu;
++            if (seg >= 1 && seg < kGfxSegmentCount && gSegments[seg] != 0 &&
++                ReadableByteLimit(gSegments[seg] + segOffset) >= requiredBytes) {
++                out.full = gSegments[seg] + segOffset;
++                out.segment = seg;
++                out.offset = segOffset;
++                out.segmented = true;
++                return true;
++            }
++        }
++#endif
+ 
+         /* Segment 9 is not a single global namespace in Expansion Kit builds:
+            Create Machine/machine-settings use the cartridge machine_models
+@@ -4247,6 +4495,16 @@ class N64DisplayListAdapter {
+             return true;
+         }
+ 
++#ifdef GDX_IMAGE_BELOW_4G
++        {
++            AssetSegmentLookup stubLookup = {};
++            if (GdxLowFix(32) && mModuleBegin != 0 && raw >= mModuleBegin && raw < mModuleEnd &&
++                LookupAssetSegment(raw, stubLookup)) {
++                return false;
++            }
++        }
++#endif
++
+         const uint32_t d1000000_low = Low32(reinterpret_cast<uintptr_t>(D_1000000));
+         for (const HostRange& range : gHostRanges) {
+             if (range.begin == reinterpret_cast<uintptr_t>(D_1000000)) {
+@@ -4273,7 +4531,11 @@ class N64DisplayListAdapter {
+             const uint8_t seg = static_cast<uint8_t>(raw >> 24);
+             const uint32_t segOffset = raw & 0x00FFFFFFu;
+             if (seg >= 1 && seg < kGfxSegmentCount && gSegments[seg] != 0 &&
+-                segOffset < kSegmentOffsetLimit) {
++                segOffset < kSegmentOffsetLimit
++#ifdef GDX_IMAGE_BELOW_4G
++                && !(GdxLowFix(4) && Ps4ImagePointerNotSegment(raw, seg, segOffset, requiredBytes, "explicit"))
++#endif
++            ) {
+                 const uintptr_t full = gSegments[seg] + segOffset;
+                 /* A segment match is authoritative only when the result is actually readable.
+                    K0_TO_PHYS truncates module data pointers to 29 bits, so e.g.
+@@ -4309,6 +4571,17 @@ class N64DisplayListAdapter {
+             return true;
+         }
+ 
++#ifdef GDX_IMAGE_BELOW_4G
++        /* PS4: the image is mapped where its 32-bit addresses are its real ones, so a value inside
++           it that no segment owns is a direct pointer (Windows needs the high-32 guesses below). */
++        if (GdxLowFix(8) && mModuleBegin != 0 && raw >= mModuleBegin && raw < mModuleEnd &&
++            ReadableByteLimit(raw) >= requiredBytes) {
++            out.full = raw;
++            out.segmented = false;
++            return true;
++        }
++#endif
++
+         /* KSEG0 (0x80000000–0x9FFFFFFF) and KSEG1 (0xA0000000–0xBFFFFFFF):
+            strip segment bits to obtain the physical RDRAM offset.
+            Ordered AFTER all asset-stub resolvers so ROM-backed stubs always win. */
+@@ -4453,7 +4726,11 @@ class N64DisplayListAdapter {
+ 
+         if ((encodedSegment < kGfxSegmentCount) &&
+             ((gSegments[encodedSegment] != 0) || (encodedSegment == 0)) &&
+-            ((raw & 0x00FFFFFF) < kSegmentOffsetLimit)) {
++            ((raw & 0x00FFFFFF) < kSegmentOffsetLimit)
++#ifdef GDX_IMAGE_BELOW_4G
++            && !(GdxLowFix(4) && Ps4ImagePointerNotSegment(raw, encodedSegment, encodedOffset, requiredBytes, "encoded"))
++#endif
++        ) {
+             const uintptr_t full = gSegments[encodedSegment] + encodedOffset;
+             /* Same readability gate as the explicit-segment path above: reject
+                truncated module pointers masquerading as segment offsets so the
+@@ -5234,8 +5511,58 @@ class N64DisplayListAdapter {
+              * game already resolved: use it verbatim, no low32 reconstruction. High bits zero
+              * means a 32-bit VALUE or a segmented address, which still flows through the segment
+              * table / value path. Narrow sources never set high bits. */
++#ifdef GDX_IMAGE_BELOW_4G
++            gImageTokenIsSegment = false;
++#endif
+             bool w1IsHostPointer =
+                 sourceIsWide && ((static_cast<uint64_t>(w1full) >> 32) != 0);
++#ifdef GDX_IMAGE_BELOW_4G
++            /* PS4: the eboot is mapped below 4 GiB (at 0x400000), so pointers into the image itself
++             * -- static display lists and data in .data, gfx pools and buffers in .bss -- have
++             * high32 == 0 and were read as segmented addresses (0x028931C0 = segment 2 + 0x8931C0,
++             * into unrelated loaded assets): every 3D model went missing. A wide word inside the
++             * image is a real host pointer; asset placeholders and BSS aliases in it are still routed
++             * back to the resolver by the exception below. */
++            if (GdxLowFix(1) && sourceIsWide && !w1IsHostPointer && mModuleBegin != 0 && w1full >= mModuleBegin &&
++                w1full < mModuleEnd) {
++                const uint8_t tokOp = Opcode(in.w0);
++                const bool pointerOp = isF3DSource
++                                           ? (tokOp == 0x01 || tokOp == 0x03 || tokOp == 0x04 || tokOp == 0x06 ||
++                                              tokOp == 0xFD)
++                                           : (tokOp == 0x01 || tokOp == 0xDA || tokOp == 0xDC || tokOp == 0xDE ||
++                                              tokOp == 0xFD);
++                /* Only commands whose word IS a pointer: texture/colour/depth images, vertices,
++                   matrices, movemem, display lists, and segment movewords. Everything else carries a
++                   value (texrect scale 0x04000400, tile sizes, colours) that merely looks like an
++                   image address -- Windows never reads those as pointers, and doing so garbled the
++                   HUD panels and racer portraits. */
++                const bool hostPointerOp = pointerOp || tokOp == 0xFE || tokOp == 0xFF ||
++                                           tokOp == (isF3DSource ? 0xBC : 0xDB);
++                unsigned char exSeg = 0, exCmp = 0;
++                unsigned int exRom = 0, exOff = 0, exSize = 0;
++                const bool exactPlaceholder =
++                    gdx_lookup_asset_segment(static_cast<uint32_t>(w1full), &exSeg, &exRom, &exCmp, &exOff, &exSize) != 0;
++                const uint8_t tokSeg = static_cast<uint8_t>(w1full >> 24);
++                const uint32_t tokOff = static_cast<uint32_t>(w1full) & 0x00FFFFFFu;
++                /* Evidence that the word is an N64 segment address rather than an image pointer:
++                   it is an asset's segment address, or it lands inside a segment whose buffer has an
++                   exactly known size (segment 2's camera matrices at 0x02000000, segment 1's gfx pool).
++                   Real image pointers in those top bytes point far past such buffers. */
++                const bool segmentAddress =
++                    GdxLowFix(2) && pointerOp && !exactPlaceholder &&
++                    (Ps4AssetSymbolForSegmentAddress(static_cast<uint32_t>(w1full)) != 0 ||
++                     Ps4SegmentExactFits(tokSeg, tokOff, 1));
++                if (segmentAddress) {
++                    /* An asset's N64 segment address (machine textures 0x03004618, the race HUD
++                       digits 0x04001CA8..0x04006EA8, ...): read it through the live segment table,
++                       exactly as Windows does. Several asset families share one segment number, so
++                       mapping it to a placeholder symbol picks the wrong family's texture. */
++                    gImageTokenIsSegment = true;
++                } else if (hostPointerOp) {
++                    w1IsHostPointer = true;
++                }
++            }
++#endif
+             /* EXCEPTION to that rule: the game references runtime-loaded segmented assets
+              * (setup_gfx render-mode DLs via gSPDisplayList(&D_3000050), vertex data via
+              * gSPVertex(&D_3000xxx)) through 1-byte BSS PLACEHOLDER symbols. The wide packet
+@@ -6847,8 +7174,18 @@ class N64DisplayListAdapter {
+                 const bool outIsOtrFilepath = (outOp == 0x24u) || (outOp == 0x25u) ||
+                                               (outOp == 0x27u) || (outOp == 0x28u) ||
+                                               (outOp == 0x29u);
+-                if (outIsOtrFilepath &&
+-                    ((static_cast<uint64_t>(outW1) >> 32) == 0 || !IsReadableAddress(outW1))) {
++                bool outLowHalfOnly = (static_cast<uint64_t>(outW1) >> 32) == 0;
++#ifdef GDX_IMAGE_BELOW_4G
++                /* Below 4 GiB the archive-name strings (AssetBindings' o2r keys, string literals in
++                   .rodata) sit inside the image, so their pointers have a zero high half -- that is
++                   every O2R texture/DL/vertex load, and dropping them left each draw on the previous
++                   texture (garbled HUD panels, shadows, machine decals). A pointer into the image is
++                   a real string; the torn 32-bit tokens this guard exists for are not. */
++                if (outLowHalfOnly && mModuleBegin != 0 && outW1 >= mModuleBegin && outW1 < mModuleEnd) {
++                    outLowHalfOnly = false;
++                }
++#endif
++                if (outIsOtrFilepath && (outLowHalfOnly || !IsReadableAddress(outW1))) {
+                     if (mStats != nullptr) mStats->skippedDataCommands++;
+                     continue;
+                 }
+@@ -7888,6 +8225,20 @@ extern "C" void* gdx_ensure_asset_segment_for_symbol(unsigned int symLow32, unsi
+ /* A/B kill switch for the wide-asset redirect below. Default ON; GDX_WIDE_ASSET_RESOLVE=0
+    restores the pre-fix verbatim wide-pointer return so a regression can be attributed to
+    this hook vs. the fixed image base that landed in the same build, without a rebuild. */
++#ifdef GDX_IMAGE_BELOW_4G
++// True for an address inside the executable image (decomp_port.c Gdx_ResolvePortAddress).
++extern "C" int gdx_main_image_contains(uintptr_t v) {
++    static uintptr_t sBegin = 0;
++    static uintptr_t sEnd = 0;
++    static bool sInit = false;
++    if (!sInit) {
++        sInit = true;
++        GetMainModuleRange(sBegin, sEnd);
++    }
++    return sBegin != 0 && v >= sBegin && v < sEnd;
++}
++#endif
++
+ extern "C" int gdx_wide_asset_resolve_enabled(void) {
+     static int sState = -1;
+     if (sState < 0) {
+diff --git a/port/n64_gfx_convert.cpp b/port/n64_gfx_convert.cpp
+index a0f7dcf..a0520ff 100644
+--- a/port/n64_gfx_convert.cpp
++++ b/port/n64_gfx_convert.cpp
+@@ -2,6 +2,7 @@
+ 
+ #include "n64_gfx_convert.h"
+ 
++#include <algorithm>
+ #include <cstring>
+ 
+ namespace gdx {
+@@ -56,7 +57,10 @@ std::vector<WideGfx> ConvertList(const void* src, size_t max_commands, bool is_b
+     if (src == nullptr) {
+         return out;
+     }
+-    out.reserve(max_commands + 1);
++    // max_commands is the READABLE span from src, not the list length: one allocation on Windows,
++    // but on PS4 the coalesced readable run is the whole 512 MiB heap or the 61 MiB image. Reserving
++    // it made every cached list hold megabytes (heap full ~18 s into a race, bad_alloc at 34 s).
++    out.reserve(std::min<size_t>(max_commands, 256) + 1);
+ 
+     const auto* bytes = static_cast<const uint8_t*>(src);
+     for (size_t i = 0; i < max_commands; ++i) {
+@@ -106,6 +110,10 @@ std::vector<WideGfx> ConvertList(const void* src, size_t max_commands, bool is_b
+         out.push_back(end);
+     }
+ 
++    // the cache keeps this vector for many frames: drop the growth slack
++    if (out.capacity() > out.size() + out.size() / 2 + 16) {
++        out.shrink_to_fit();
++    }
+     return out;
+ }
+ 
+diff --git a/port/port_log.h b/port/port_log.h
+index b4a38c2..66ae9e4 100644
+--- a/port/port_log.h
++++ b/port/port_log.h
+@@ -101,10 +101,26 @@ static inline const char* gdx_crash_report_path(char* outPath, size_t outCap) {
+ // Holds the file handle open instead of fopen/fclose per call: the Debug CRT's internal dynamic
+ // buffer deallocates on a stack frame the fiber scheduler may have switched out, which corrupts
+ // the heap when this is called from the GFX fiber.
++#ifdef __ORBIS__
++// G-Diffuser-PS4 port/ps4_crashlog.cpp: /data/gdiffuser/boot-trace.log, the console's only log.
++#ifdef __cplusplus
++extern "C"
++#endif
++    __attribute__((weak)) void
++    ps4_boot_trace(const char* line);
++#endif
++
+ static inline void gdx_port_write_log(const char* message) {
+     if (message == NULL) {
+         return;
+     }
++#ifdef __ORBIS__
++    /* [venueload] fires twice per frame in a race (the venue lookup is a cache hit every tick):
++       megabytes of file writes on the game thread for nothing, so the mirror skips it. */
++    if (ps4_boot_trace != NULL && strstr(message, "[venueload]") == NULL) {
++        ps4_boot_trace(message);
++    }
++#endif
+ 
+     if (gdx_port_log_tap != NULL) {
+         gdx_port_log_tap(message);
+diff --git a/port/ps4/discord_stub.c b/port/ps4/discord_stub.c
+new file mode 100644
+index 0000000..8e603c3
+--- /dev/null
++++ b/port/ps4/discord_stub.c
+@@ -0,0 +1,23 @@
++/* port/ps4/discord_stub.c -- no-op discord-rpc for the PS4 build.
++ *
++ * There is no Discord client on the console. gdx_discord.cpp is kept unchanged and calls these;
++ * with the master toggle off (the default) it never calls them at all. */
++#include "discord_rpc.h"
++
++void Discord_Initialize(const char* applicationId, DiscordEventHandlers* handlers, int autoRegister,
++                        const char* optionalSteamId) {
++    (void) applicationId;
++    (void) handlers;
++    (void) autoRegister;
++    (void) optionalSteamId;
++}
++void Discord_Shutdown(void) {}
++void Discord_RunCallbacks(void) {}
++void Discord_UpdateConnection(void) {}
++void Discord_UpdatePresence(const DiscordRichPresence* presence) { (void) presence; }
++void Discord_ClearPresence(void) {}
++void Discord_Respond(const char* userid, int reply) {
++    (void) userid;
++    (void) reply;
++}
++void Discord_UpdateHandlers(DiscordEventHandlers* handlers) { (void) handlers; }
+diff --git a/port/ps4/ps4_paths.cpp b/port/ps4/ps4_paths.cpp
+new file mode 100644
+index 0000000..76b3645
+--- /dev/null
++++ b/port/ps4/ps4_paths.cpp
+@@ -0,0 +1,133 @@
++// port/ps4/ps4_paths.cpp -- relative paths on the PS4.
++//
++// G-Diffuser opens much of its state by relative path ("saves/fzerox.sav", "saves/...json", the
++// config and logs), expecting the working directory to be the game folder. On the console
++// chdir() succeeds but relative paths still do not resolve (and getcwd() fails), so the libc
++// entry points that take a path are wrapped (linker --wrap, port/CMakeLists.txt) and resolve
++// relative paths against /data/gdiffuser. Absolute paths pass through untouched.
++#include <cerrno>
++#include <cstdarg>
++#include <cstdio>
++#include <cstring>
++
++#include <dirent.h>
++#include <fcntl.h>
++#include <sys/stat.h>
++#include <unistd.h>
++
++namespace {
++
++const char kRoot[] = "/data/gdiffuser/";
++
++// Returns `path` itself when it is absolute (or null/empty), else `buf` holding the joined path.
++const char* Resolve(const char* path, char* buf, size_t size) {
++    if (path == nullptr || path[0] == '\0' || path[0] == '/') {
++        return path;
++    }
++    while (path[0] == '.' && path[1] == '/') {
++        path += 2;
++    }
++    if (path[0] == '.' && path[1] == '\0') {
++        path = "";
++    }
++    snprintf(buf, size, "%s%s", kRoot, path);
++    return buf;
++}
++
++} // namespace
++
++#define GDX_PS4_PATH(var, path)                                                                   \
++    char var##Buf[1024];                                                                          \
++    const char* var = Resolve(path, var##Buf, sizeof(var##Buf))
++
++extern "C" {
++
++int __real_open(const char* path, int flags, ...);
++int __wrap_open(const char* path, int flags, ...) {
++    mode_t mode = 0;
++    if (flags & O_CREAT) {
++        va_list args;
++        va_start(args, flags);
++        mode = (mode_t)va_arg(args, int);
++        va_end(args);
++    }
++    GDX_PS4_PATH(p, path);
++    return __real_open(p, flags, mode);
++}
++
++FILE* __real_fopen(const char* path, const char* mode);
++FILE* __wrap_fopen(const char* path, const char* mode) {
++    GDX_PS4_PATH(p, path);
++    return __real_fopen(p, mode);
++}
++
++int __real_stat(const char* path, struct stat* st);
++int __wrap_stat(const char* path, struct stat* st) {
++    GDX_PS4_PATH(p, path);
++    return __real_stat(p, st);
++}
++
++int __real_lstat(const char* path, struct stat* st);
++int __wrap_lstat(const char* path, struct stat* st) {
++    GDX_PS4_PATH(p, path);
++    return __real_lstat(p, st);
++}
++
++int __real_access(const char* path, int mode);
++int __wrap_access(const char* path, int mode) {
++    GDX_PS4_PATH(p, path);
++    return __real_access(p, mode);
++}
++
++// mkdir on an existing directory must fail with EEXIST, which callers treat as success
++// (gdx_achievements and sram_buffer's saves/); the console reports something else.
++int __real_mkdir(const char* path, mode_t mode);
++int __wrap_mkdir(const char* path, mode_t mode) {
++    GDX_PS4_PATH(p, path);
++    const int r = __real_mkdir(p, mode);
++    if (r != 0 && errno != EEXIST) {
++        const int saved = errno;
++        struct stat st;
++        errno = (p != nullptr && __real_stat(p, &st) == 0 && S_ISDIR(st.st_mode)) ? EEXIST : saved;
++    }
++    return r;
++}
++
++int __real_rmdir(const char* path);
++int __wrap_rmdir(const char* path) {
++    GDX_PS4_PATH(p, path);
++    return __real_rmdir(p);
++}
++
++int __real_unlink(const char* path);
++int __wrap_unlink(const char* path) {
++    GDX_PS4_PATH(p, path);
++    return __real_unlink(p);
++}
++
++int __real_remove(const char* path);
++int __wrap_remove(const char* path) {
++    GDX_PS4_PATH(p, path);
++    return __real_remove(p);
++}
++
++int __real_rename(const char* from, const char* to);
++int __wrap_rename(const char* from, const char* to) {
++    GDX_PS4_PATH(f, from);
++    GDX_PS4_PATH(t, to);
++    return __real_rename(f, t);
++}
++
++DIR* __real_opendir(const char* path);
++DIR* __wrap_opendir(const char* path) {
++    GDX_PS4_PATH(p, path);
++    return __real_opendir(p);
++}
++
++int __real_truncate(const char* path, off_t length);
++int __wrap_truncate(const char* path, off_t length) {
++    GDX_PS4_PATH(p, path);
++    return __real_truncate(p, length);
++}
++
++} // extern "C"
+diff --git a/port/ps4/ps4_platform.cpp b/port/ps4/ps4_platform.cpp
+new file mode 100644
+index 0000000..6036da2
+--- /dev/null
++++ b/port/ps4/ps4_platform.cpp
+@@ -0,0 +1,211 @@
++// port/ps4/ps4_platform.cpp -- PS4 startup: the data directory and the packaged game data.
++//
++// The package carries the game data the PC version's first boot built (fzerox.o2r,
++// fzerox-disk.o2r, n64ddipl.o2r, the setup/extraction state files) plus the engine archive and
++// fonts, under /app0/gdiffuser. /app0 is read-only and G-Diffuser keeps everything in one
++// writable folder, so they are copied to /data/gdiffuser: once, and again whenever a packaged
++// file's size changes (a newer package). Saves, config and logs are only ever created there.
++#include <algorithm>
++#include <cerrno>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <filesystem>
++#include <string>
++#include <system_error>
++
++#include <fcntl.h>
++#include <sys/stat.h>
++#include <unistd.h>
++
++#include <SDL2/SDL.h>
++
++namespace fs = std::filesystem;
++
++extern "C" __attribute__((weak)) void ps4_boot_trace(const char* line); // port/ps4_crashlog.cpp
++
++namespace {
++
++const char* const kPackaged = "/app0/gdiffuser";
++const char* const kData = "/data/gdiffuser";
++
++void Trace(const std::string& line) {
++    if (ps4_boot_trace != nullptr) {
++        ps4_boot_trace((line + "\n").c_str());
++    }
++}
++
++// Setup and extraction state: copied when absent only, so the console's own state wins.
++bool IsStateFile(const std::string& rel) {
++    const std::string name = fs::path(rel).filename().string();
++    return name == "gdx_firstboot.cfg" || name == "gdx_extract_state.cfg";
++}
++
++// Plain POSIX I/O: libc++'s fs::copy_file also copies the permission bits, which /data refuses
++// ("Permission denied" on the console), and fs::relative gave empty paths there.
++bool CopyFile(const std::string& from, const std::string& to) {
++    std::error_code ec;
++    fs::create_directories(fs::path(to).parent_path(), ec);
++    const std::string partial = to + ".partial";
++    const int in = open(from.c_str(), O_RDONLY);
++    if (in < 0) {
++        Trace("ps4: open " + from + " failed: " + strerror(errno));
++        return false;
++    }
++    const int out = open(partial.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0666);
++    if (out < 0) {
++        Trace("ps4: create " + partial + " failed: " + strerror(errno));
++        close(in);
++        return false;
++    }
++    static char buffer[1 << 20];
++    bool ok = true;
++    for (;;) {
++        const ssize_t n = read(in, buffer, sizeof(buffer));
++        if (n == 0) {
++            break;
++        }
++        if (n < 0 || write(out, buffer, (size_t)n) != n) {
++            Trace("ps4: copy " + from + " failed: " + strerror(errno));
++            ok = false;
++            break;
++        }
++    }
++    close(in);
++    if (close(out) != 0) {
++        ok = false;
++    }
++    if (ok && rename(partial.c_str(), to.c_str()) != 0) {
++        Trace("ps4: rename " + partial + " failed: " + strerror(errno));
++        ok = false;
++    }
++    if (!ok) {
++        unlink(partial.c_str());
++    }
++    return ok;
++}
++
++off_t FileSize(const std::string& path) {
++    struct stat st;
++    return stat(path.c_str(), &st) == 0 ? st.st_size : (off_t)-1;
++}
++
++} // namespace
++
++// DualShock 4 through SDL's PS4 joystick driver (PacBrew SDL 2.0.18): buttons are numbered like
++// SDL's game controller layout except that Options and the touchpad sit in the Back and Start
++// slots (DolphinPS4 / SRB2-PS4), and the D-pad is hat 0. SDL's own mapping for the pad follows
++// that numbering, which put Options on Back (G-Diffuser's menu) and the touchpad on Start, so the
++// mapping is always replaced: Options = Start (the game's pause), touchpad = Back (the quick menu).
++extern "C" void gdx_ps4_init_controllers(void) {
++    char line[256];
++    for (int i = 0; i < SDL_NumJoysticks(); i++) {
++        char guid[64];
++        SDL_JoystickGetGUIDString(SDL_JoystickGetDeviceGUID(i), guid, sizeof(guid));
++        const bool known = SDL_IsGameController(i);
++        snprintf(line, sizeof(line), "ps4: joystick %d \"%s\" guid %s, %s", i, SDL_JoystickNameForIndex(i), guid,
++                 known ? "replacing its mapping with the DualShock 4 one" : "adding a DualShock 4 mapping");
++        Trace(line);
++        {
++            std::string mapping = std::string(guid) +
++                                  ",DualShock 4 (PS4),a:b0,b:b1,x:b2,y:b3,start:b4,guide:b5,back:b6,"
++                                  "leftstick:b7,rightstick:b8,leftshoulder:b9,rightshoulder:b10,"
++                                  "dpup:h0.1,dpright:h0.2,dpdown:h0.4,dpleft:h0.8,"
++                                  "leftx:a0,lefty:a1,rightx:a2,righty:a3,lefttrigger:a4,righttrigger:a5,";
++            if (SDL_GameControllerAddMapping(mapping.c_str()) < 0) {
++                Trace(std::string("ps4: SDL_GameControllerAddMapping failed: ") + SDL_GetError());
++            }
++        }
++        if (SDL_Joystick* js = SDL_JoystickOpen(i)) {
++            snprintf(line, sizeof(line), "ps4: joystick %d: %d axes, %d buttons, %d hats", i, SDL_JoystickNumAxes(js),
++                     SDL_JoystickNumButtons(js), SDL_JoystickNumHats(js));
++            Trace(line);
++            SDL_JoystickClose(js);
++        }
++    }
++}
++
++// getcwd fails on the console, which makes std::filesystem::current_path() and absolute() of a
++// relative path throw. The working directory is only ever set once, by gdx_ps4_prepare_data, so
++// the wrapper (linked with --wrap=getcwd) answers with it when the real call fails.
++extern "C" char* __real_getcwd(char* buf, size_t size);
++extern "C" char* __wrap_getcwd(char* buf, size_t size) {
++    char* r = __real_getcwd(buf, size);
++    if (r != nullptr) {
++        return r;
++    }
++    const size_t need = strlen(kData) + 1;
++    if (buf == nullptr) {
++        buf = (char*)malloc(size > need ? size : need);
++        if (buf == nullptr) {
++            errno = ENOMEM;
++            return nullptr;
++        }
++    } else if (size < need) {
++        errno = ERANGE;
++        return nullptr;
++    }
++    memcpy(buf, kData, need);
++    return buf;
++}
++
++// The port finds its game folder through readlink("/proc/self/exe") in several places
++// (gdx_firstboot, sram/disk/rom buffers, the log path); the PS4 has no /proc. Answer with an
++// eboot path inside the game folder (--wrap=readlink).
++extern "C" ssize_t __real_readlink(const char* path, char* buf, size_t size);
++extern "C" ssize_t __wrap_readlink(const char* path, char* buf, size_t size) {
++    if (path != nullptr && strcmp(path, "/proc/self/exe") == 0) {
++        const std::string exe = std::string(kData) + "/eboot.bin";
++        const size_t n = std::min(exe.size(), size);
++        memcpy(buf, exe.data(), n);
++        return (ssize_t)n;
++    }
++    return __real_readlink(path, buf, size);
++}
++
++extern "C" const char* gdx_ps4_data_dir(void) {
++    return kData;
++}
++
++extern "C" void gdx_ps4_prepare_data(void) {
++    std::error_code ec;
++    fs::create_directories(fs::path(kData) / "saves", ec);
++    fs::create_directories(fs::path(kData) / "logs", ec);
++
++    unsigned copied = 0, kept = 0, failed = 0;
++    uintmax_t bytes = 0;
++    const std::string prefix = std::string(kPackaged) + "/";
++    if (fs::is_directory(kPackaged, ec)) {
++        for (auto it = fs::recursive_directory_iterator(kPackaged, ec); !ec && it != fs::recursive_directory_iterator();
++             it.increment(ec)) {
++            const std::string src = it->path().string();
++            if (it->is_directory(ec) || src.compare(0, prefix.size(), prefix) != 0) {
++                continue;
++            }
++            const std::string rel = src.substr(prefix.size());
++            const std::string dst = std::string(kData) + "/" + rel;
++            const off_t size = FileSize(src);
++            const off_t have = FileSize(dst);
++            if (have >= 0 && (IsStateFile(rel) || have == size)) {
++                kept++;
++                continue;
++            }
++            if (CopyFile(src, dst)) {
++                copied++;
++                bytes += (uintmax_t)size;
++            } else {
++                failed++;
++            }
++        }
++    } else {
++        Trace("ps4: no packaged game data in /app0/gdiffuser");
++    }
++    char line[160];
++    snprintf(line, sizeof(line), "ps4: game data: %u file(s) copied (%llu KiB), %u up to date, %u failed",
++             copied, (unsigned long long)(bytes / 1024), kept, failed);
++    Trace(line);
++
++    if (chdir(kData) != 0) {
++        Trace(std::string("ps4: chdir /data/gdiffuser failed: ") + strerror(errno));
++    }
++}
+diff --git a/port/ps4/quick_menu.cpp b/port/ps4/quick_menu.cpp
+new file mode 100644
+index 0000000..56ffe6c
+--- /dev/null
++++ b/port/ps4/quick_menu.cpp
+@@ -0,0 +1,1313 @@
++// port/ps4/quick_menu.cpp -- the PS4 quick menu, ported from Resonance (G-Diffuser-PS4's sibling
++// Flycast port: shell/ps4/launcher/quick_menu.cpp, xmb_style.cpp, sound.cpp).
++//
++// The touchpad or L3+R3 during the game pauses it behind a side panel in the PS3 look: the month's
++// colour, a gliding highlight, the clock and button hints, the menu sounds. Rows: Resume, Reset
++// Game, Volume, FPS counter and Widescreen (changed on the spot with Left/Right), Settings (a
++// PS3-style list of G-Diffuser's main options in groups, L1/R1 between groups), Enhancements (the
++// full G-Diffuser menu, for everything else; the touchpad closes it) and Close Game.
++//
++// While the menu is up the frame loop does not tick the game (no VI retrace, no game threads): it
++// presents the last game frame, copied once when the menu opened, with the menu over it.
++#include "quick_menu.h"
++
++#include <SDL2/SDL.h>
++#include <imgui.h>
++#include <imgui_internal.h>
++
++#include <orbis/AudioOut.h>
++#include <orbis/SystemService.h>
++
++#include <algorithm>
++#include <atomic>
++#include <chrono>
++#include <cmath>
++#include <cstdio>
++#include <cstring>
++#include <ctime>
++#include <functional>
++#include <mutex>
++#include <string>
++#include <thread>
++#include <vector>
++
++#include "ship/Context.h"
++#include "ship/window/Window.h"
++#include "ship/window/gui/Gui.h"
++#include "ship/window/gui/IconsFontAwesome4.h"
++#include "fast/Fast3dWindow.h"
++#include "fast/interpreter.h"
++#include "fast/backends/gfx_vulkan.h"
++#include "gdx_menu.h"
++#include "ui/MenuTypes.h"
++#include "ui/UIWidgets.hpp"
++#include "libultraship/bridge/consolevariablebridge.h"
++
++#include "gdx_gui.h"
++#include "port_log.h"
++
++extern "C" void gdx_game_request_reset(void);
++
++namespace {
++
++constexpr float PI = 3.14159265f;
++
++// ------------------------------------------------------------------------------------------------
++// Style (Resonance xmb_style.cpp / launcher.cpp)
++// ------------------------------------------------------------------------------------------------
++
++struct Color {
++    float r = 0, g = 0, b = 0;
++    ImU32 u32(float a = 1.f) const {
++        auto c = [](float v) { return (int)std::lround(std::fmin(1.f, std::fmax(0.f, v)) * 255.f); };
++        return IM_COL32(c(r), c(g), c(b), c(a));
++    }
++};
++
++Color mix(const Color& a, const Color& b, float t) {
++    return { a.r + (b.r - a.r) * t, a.g + (b.g - a.g) * t, a.b + (b.b - a.b) * t };
++}
++
++float clamp01(float t) {
++    return std::fmin(1.f, std::fmax(0.f, t));
++}
++
++float easeOut(float t) {
++    t = clamp01(t);
++    return 1.f - (1.f - t) * (1.f - t) * (1.f - t);
++}
++
++void spring(float& pos, float& vel, float goal, float stiffness, float damping, float dt) {
++    // a few sub-steps keep stiff springs stable at low frame rates
++    for (int i = 0; i < 4; i++) {
++        const float h = dt / 4;
++        vel += (stiffness * (goal - pos) - damping * vel) * h;
++        pos += vel * h;
++    }
++}
++
++// The console's time zone (homebrew's localtime() is UTC), re-read once a minute.
++long utcOffset() {
++    static long offset;
++    static time_t readAt;
++    const time_t now = time(nullptr);
++    if (readAt == 0 || now - readAt >= 60 || now < readAt) {
++        int32_t zone = 0, summer = 0;
++        if (sceSystemServiceParamGetInt(ORBIS_SYSTEM_SERVICE_PARAM_ID_TIME_ZONE, &zone) != 0) {
++            zone = 0;
++        }
++        if (sceSystemServiceParamGetInt(ORBIS_SYSTEM_SERVICE_PARAM_ID_SUMMERTIME, &summer) != 0) {
++            summer = 0;
++        }
++        offset = (long)zone * 60 + (summer ? 3600 : 0);
++        readAt = now;
++    }
++    return offset;
++}
++
++const struct tm* localTm(time_t t) {
++    static struct tm out;
++    const time_t local = t + utcOffset();
++    const struct tm* g = gmtime(&local);
++    if (g == nullptr) {
++        return nullptr;
++    }
++    out = *g;
++    return &out;
++}
++
++Color xmbTone() {
++    // January silver, February gold, March lime, April pink, May green, June violet, July teal,
++    // August blue, September purple, October amber, November brown, December red
++    static const Color months[12] = {
++        { .62f, .64f, .70f }, { .80f, .64f, .16f }, { .46f, .66f, .16f }, { .84f, .42f, .60f },
++        { .14f, .56f, .26f }, { .56f, .34f, .76f }, { .10f, .56f, .64f }, { .16f, .38f, .82f },
++        { .44f, .24f, .66f }, { .76f, .56f, .12f }, { .52f, .32f, .18f }, { .74f, .14f, .16f },
++    };
++    const tm* lt = localTm(time(nullptr));
++    return months[lt != nullptr ? lt->tm_mon % 12 : 7];
++}
++
++struct Frame {
++    ImDrawList* dl;
++    float w, h; // screen size
++    float t, dt; // seconds since the menu module started, frame time
++};
++
++// Seconds since the module started. Safe outside an ImGui frame (GdxPs4QuickMenuUpdate runs
++// before Gui::StartDraw, where there is no draw list yet).
++float nowSeconds() {
++    static auto start = std::chrono::steady_clock::now();
++    return std::chrono::duration<float>(std::chrono::steady_clock::now() - start).count();
++}
++
++// Only inside the ImGui frame (GdxPs4QuickMenuDraw).
++Frame menuFrame() {
++    ImGuiIO& io = ImGui::GetIO();
++    Frame f{};
++    f.dl = ImGui::GetForegroundDrawList();
++    f.w = io.DisplaySize.x;
++    f.h = io.DisplaySize.y;
++    f.t = nowSeconds();
++    f.dt = std::min(.05f, io.DeltaTime);
++    return f;
++}
++
++ImFont* bodyFont() {
++    ImFont* font = GdxGuiFontQuickMenu();
++    return font != nullptr ? font : ImGui::GetFont();
++}
++
++float textWidth(ImFont* font, float size, const std::string& text) {
++    return font->CalcTextSizeA(size, FLT_MAX, 0.f, text.c_str()).x;
++}
++
++float drawText(ImDrawList* dl, ImFont* font, float size, ImVec2 pos, ImU32 col, const std::string& text,
++               float align = 0.f, float maxWidth = 0.f) {
++    std::string s = text;
++    float width = textWidth(font, size, s);
++    if (maxWidth > 0 && width > maxWidth) {
++        const std::string dots = "...";
++        while (!s.empty() && textWidth(font, size, s + dots) > maxWidth) {
++            s.pop_back();
++            while (!s.empty() && ((unsigned char)s.back() & 0xC0) == 0x80) { // whole UTF-8 characters
++                s.pop_back();
++            }
++        }
++        s += dots;
++        width = textWidth(font, size, s);
++    }
++    dl->AddText(font, size, ImVec2(std::round(pos.x - width * align), std::round(pos.y)), col, s.c_str());
++    return width;
++}
++
++// White text with a soft shadow
++float xmbText(ImDrawList* dl, ImFont* font, float size, ImVec2 pos, float alpha, const std::string& text,
++              float align = 0.f, float maxWidth = 0.f, ImU32 color = IM_COL32(255, 255, 255, 255)) {
++    if (alpha <= 0) {
++        return 0;
++    }
++    const float off = std::max(1.f, size * .06f);
++    drawText(dl, font, size, ImVec2(pos.x + off, pos.y + off), IM_COL32(0, 0, 0, (int)(110 * alpha)), text, align,
++             maxWidth);
++    const ImU32 c =
++        (color & ~IM_COL32_A_MASK) | ((ImU32)(((color >> IM_COL32_A_SHIFT) & 0xff) * alpha) << IM_COL32_A_SHIFT);
++    return drawText(dl, font, size, pos, c, text, align, maxWidth);
++}
++
++// The PS button symbols: 'x' cross, 'o' circle, 's' square, 't' triangle, 'l' L1, 'r' R1
++void drawButton(ImDrawList* dl, char which, ImVec2 c, float size, float alpha) {
++    const float r = size * .5f, t = std::fmax(1.5f, size * .1f);
++    dl->AddCircleFilled(c, r, IM_COL32(20, 24, 34, (int)(200 * alpha)));
++    const float k = r * .48f;
++    switch (which) {
++        case 'x': {
++            const ImU32 col = IM_COL32(120, 170, 255, (int)(255 * alpha));
++            dl->AddLine(ImVec2(c.x - k, c.y - k), ImVec2(c.x + k, c.y + k), col, t);
++            dl->AddLine(ImVec2(c.x - k, c.y + k), ImVec2(c.x + k, c.y - k), col, t);
++            break;
++        }
++        case 'o':
++            dl->AddCircle(c, k * 1.05f, IM_COL32(255, 100, 110, (int)(255 * alpha)), 24, t);
++            break;
++        case 's':
++            dl->AddRect(ImVec2(c.x - k * .9f, c.y - k * .9f), ImVec2(c.x + k * .9f, c.y + k * .9f),
++                        IM_COL32(240, 140, 220, (int)(255 * alpha)), 0, 0, t);
++            break;
++        case 't':
++            dl->AddTriangle(ImVec2(c.x, c.y - k * 1.05f), ImVec2(c.x + k * 1.05f, c.y + k * .75f),
++                            ImVec2(c.x - k * 1.05f, c.y + k * .75f), IM_COL32(90, 220, 180, (int)(255 * alpha)), t);
++            break;
++        case 'l':
++        case 'r':
++            drawText(dl, bodyFont(), size * .46f, ImVec2(c.x, c.y - size * .3f), IM_COL32(230, 234, 242, (int)(255 * alpha)),
++                     which == 'l' ? "L1" : "R1", .5f);
++            break;
++    }
++}
++
++void xmbClock(Frame& f, float alpha) {
++    char clock[32];
++    const tm* lt = localTm(time(nullptr));
++    if (lt == nullptr) {
++        return;
++    }
++    strftime(clock, sizeof(clock), "%d/%m  %H:%M", lt);
++    const float size = f.h * .026f;
++    const float w = xmbText(f.dl, bodyFont(), size, ImVec2(f.w * .94f, f.h * .055f), alpha, clock, 1.f);
++    // the PS3's little clock face beside it
++    const ImVec2 c(f.w * .94f - w - size * .9f, f.h * .055f + size * .55f);
++    f.dl->AddCircle(c, size * .45f, IM_COL32(255, 255, 255, (int)(220 * alpha)), 20, 1.5f);
++    const float h = (lt->tm_hour % 12 + lt->tm_min / 60.f) / 12.f * 2 * PI, m = lt->tm_min / 60.f * 2 * PI;
++    f.dl->AddLine(c, ImVec2(c.x + std::sin(h) * size * .25f, c.y - std::cos(h) * size * .25f),
++                  IM_COL32(255, 255, 255, (int)(220 * alpha)), 1.5f);
++    f.dl->AddLine(c, ImVec2(c.x + std::sin(m) * size * .36f, c.y - std::cos(m) * size * .36f),
++                  IM_COL32(255, 255, 255, (int)(220 * alpha)), 1.5f);
++}
++
++struct Hint {
++    char button;
++    std::string label;
++};
++
++// Button hints at the bottom right
++void xmbHints(Frame& f, const std::vector<Hint>& hints, float alpha) {
++    if (alpha <= 0) {
++        return;
++    }
++    ImFont* font = bodyFont();
++    const float size = f.h * .028f, fs = f.h * .022f, y = f.h * .935f, gap = size * .5f;
++    float total = 0;
++    for (const Hint& h : hints) {
++        total += size + gap + textWidth(font, fs, h.label) + size * 1.2f;
++    }
++    float x = f.w * .94f - total;
++    for (const Hint& h : hints) {
++        drawButton(f.dl, h.button, ImVec2(x + size / 2, y), size, alpha);
++        x += size + gap;
++        x += xmbText(f.dl, font, fs, ImVec2(x, y - fs * .62f), alpha * .9f, h.label);
++        x += size * 1.2f;
++    }
++}
++
++// ------------------------------------------------------------------------------------------------
++// Sounds (Resonance sound.cpp): PCM WAVs mixed on a small sceAudioOut port of their own
++// ------------------------------------------------------------------------------------------------
++
++enum class Sound { Move, Category, Confirm, Launch, Back, Error };
++
++constexpr int32_t kSystemUser = 0xFF;
++constexpr uint32_t kGrain = 256;
++constexpr int SOUND_COUNT = 6;
++constexpr int VOICES = 6;
++const char* const kSoundNames[SOUND_COUNT] = { "move", "category", "confirm", "launch", "back", "error" };
++const float kGain[SOUND_COUNT] = { .45f, .55f, .6f, .7f, .5f, .55f };
++
++std::vector<int16_t> gClips[SOUND_COUNT]; // interleaved stereo
++bool gClipsLoaded;
++struct Voice {
++    int clip = -1;
++    size_t pos = 0;
++};
++std::mutex gSoundMutex;
++Voice gVoices[VOICES];
++std::atomic<bool> gSoundRunning;
++std::thread gSoundThread;
++int32_t gSoundPort = -1;
++
++uint32_t le32(const uint8_t* p) {
++    return p[0] | (p[1] << 8) | (p[2] << 16) | ((uint32_t)p[3] << 24);
++}
++uint16_t le16(const uint8_t* p) {
++    return p[0] | (p[1] << 8);
++}
++
++// PCM 16-bit WAV, mono or stereo, into interleaved stereo
++bool loadWav(const std::string& path, std::vector<int16_t>& out) {
++    FILE* f = fopen(path.c_str(), "rb");
++    if (f == nullptr) {
++        return false;
++    }
++    std::vector<uint8_t> file;
++    uint8_t buf[8192];
++    size_t n;
++    while ((n = fread(buf, 1, sizeof(buf), f)) > 0) {
++        file.insert(file.end(), buf, buf + n);
++    }
++    fclose(f);
++    if (file.size() < 12 || memcmp(&file[0], "RIFF", 4) || memcmp(&file[8], "WAVE", 4)) {
++        return false;
++    }
++    int channels = 0, bits = 0;
++    size_t p = 12;
++    while (p + 8 <= file.size()) {
++        const uint32_t size = le32(&file[p + 4]);
++        const size_t body = p + 8;
++        if (body + size > file.size()) {
++            break;
++        }
++        if (!memcmp(&file[p], "fmt ", 4) && size >= 16) {
++            channels = le16(&file[body + 2]);
++            bits = le16(&file[body + 14]);
++        } else if (!memcmp(&file[p], "data", 4) && bits == 16 && (channels == 1 || channels == 2)) {
++            const size_t frames = size / (2 * channels);
++            out.resize(frames * 2);
++            for (size_t i = 0; i < frames; i++) {
++                const int16_t l = (int16_t)le16(&file[body + i * 2 * channels]);
++                out[i * 2] = l;
++                out[i * 2 + 1] = channels == 2 ? (int16_t)le16(&file[body + i * 4 + 2]) : l;
++            }
++            return true;
++        }
++        p = body + size + (size & 1);
++    }
++    return false;
++}
++
++void soundLoop() {
++    alignas(64) int16_t out[kGrain * 2];
++    float mixBuf[kGrain * 2];
++    while (gSoundRunning) {
++        std::fill(std::begin(mixBuf), std::end(mixBuf), 0.f);
++        {
++            std::lock_guard<std::mutex> lock(gSoundMutex);
++            for (Voice& v : gVoices) {
++                if (v.clip < 0) {
++                    continue;
++                }
++                const std::vector<int16_t>& clip = gClips[v.clip];
++                const float gain = kGain[v.clip];
++                const size_t n = std::min<size_t>(kGrain * 2, clip.size() - v.pos);
++                for (size_t i = 0; i < n; i++) {
++                    mixBuf[i] += clip[v.pos + i] * gain;
++                }
++                v.pos += n;
++                if (v.pos >= clip.size()) {
++                    v.clip = -1;
++                }
++            }
++        }
++        for (uint32_t i = 0; i < kGrain * 2; i++) {
++            out[i] = (int16_t)std::clamp(mixBuf[i], -32768.f, 32767.f);
++        }
++        sceAudioOutOutput(gSoundPort, out); // blocks for one grain
++    }
++    sceAudioOutOutput(gSoundPort, nullptr); // wait for the last grain
++}
++
++void soundStart() {
++    if (gSoundRunning) {
++        return;
++    }
++    if (!gClipsLoaded) {
++        gClipsLoaded = true;
++        for (int i = 0; i < SOUND_COUNT; i++) {
++            loadWav(std::string("/data/gdiffuser/quickmenu/sounds/") + kSoundNames[i] + ".wav", gClips[i]);
++        }
++    }
++    const int32_t init = sceAudioOutInit();
++    if (init != 0 && init != (int32_t)0x8026000E) { // already initialized (SDL's audio)
++        return;
++    }
++    gSoundPort = sceAudioOutOpen(kSystemUser, ORBIS_AUDIO_OUT_PORT_TYPE_MAIN, 0, kGrain, 48000,
++                                 ORBIS_AUDIO_OUT_PARAM_FORMAT_S16_STEREO);
++    if (gSoundPort < 0) {
++        return;
++    }
++    int32_t volume[2] = { 32768, 32768 };
++    sceAudioOutSetVolume(gSoundPort, 0x3, volume);
++    gSoundRunning = true;
++    gSoundThread = std::thread(soundLoop);
++}
++
++void soundStop() {
++    if (!gSoundRunning) {
++        return;
++    }
++    gSoundRunning = false;
++    if (gSoundThread.joinable()) {
++        gSoundThread.join();
++    }
++    sceAudioOutClose(gSoundPort);
++    gSoundPort = -1;
++    std::lock_guard<std::mutex> lock(gSoundMutex);
++    for (Voice& v : gVoices) {
++        v.clip = -1;
++    }
++}
++
++void playSound(Sound s) {
++    const int clip = (int)s;
++    if (!gSoundRunning || clip < 0 || clip >= SOUND_COUNT || gClips[clip].empty()) {
++        return;
++    }
++    std::lock_guard<std::mutex> lock(gSoundMutex);
++    // a free voice, else the one closest to its end
++    Voice* best = &gVoices[0];
++    for (Voice& v : gVoices) {
++        if (v.clip < 0) {
++            best = &v;
++            break;
++        }
++        if (v.pos > best->pos) {
++            best = &v;
++        }
++    }
++    best->clip = clip;
++    best->pos = 0;
++}
++
++// ------------------------------------------------------------------------------------------------
++// The pad (SDL game controller, DualShock 4 mapping from port/ps4/ps4_platform.cpp)
++// ------------------------------------------------------------------------------------------------
++
++SDL_GameController* gPad;
++
++SDL_GameController* pad() {
++    if (gPad != nullptr && SDL_GameControllerGetAttached(gPad)) {
++        return gPad;
++    }
++    if (gPad != nullptr) {
++        SDL_GameControllerClose(gPad);
++        gPad = nullptr;
++    }
++    for (int i = 0; i < SDL_NumJoysticks(); i++) {
++        if (SDL_IsGameController(i) && (gPad = SDL_GameControllerOpen(i)) != nullptr) {
++            break;
++        }
++    }
++    return gPad;
++}
++
++enum PadBit : uint32_t {
++    P_CROSS = 1 << 0,
++    P_CIRCLE = 1 << 1,
++    P_SQUARE = 1 << 2,
++    P_TRIANGLE = 1 << 3,
++    P_L1 = 1 << 4,
++    P_R1 = 1 << 5,
++    P_UP = 1 << 6,
++    P_DOWN = 1 << 7,
++    P_LEFT = 1 << 8,
++    P_RIGHT = 1 << 9,
++    P_TOUCHPAD = 1 << 10,
++    P_L3 = 1 << 11,
++    P_R3 = 1 << 12,
++};
++
++uint32_t padButtons(float& lx, float& ly) {
++    lx = ly = 0;
++    SDL_GameController* c = pad();
++    if (c == nullptr) {
++        return 0;
++    }
++    auto b = [c](SDL_GameControllerButton button) { return SDL_GameControllerGetButton(c, button) != 0; };
++    uint32_t out = 0;
++    out |= b(SDL_CONTROLLER_BUTTON_A) ? P_CROSS : 0;
++    out |= b(SDL_CONTROLLER_BUTTON_B) ? P_CIRCLE : 0;
++    out |= b(SDL_CONTROLLER_BUTTON_X) ? P_SQUARE : 0;
++    out |= b(SDL_CONTROLLER_BUTTON_Y) ? P_TRIANGLE : 0;
++    out |= b(SDL_CONTROLLER_BUTTON_LEFTSHOULDER) ? P_L1 : 0;
++    out |= b(SDL_CONTROLLER_BUTTON_RIGHTSHOULDER) ? P_R1 : 0;
++    out |= b(SDL_CONTROLLER_BUTTON_DPAD_UP) ? P_UP : 0;
++    out |= b(SDL_CONTROLLER_BUTTON_DPAD_DOWN) ? P_DOWN : 0;
++    out |= b(SDL_CONTROLLER_BUTTON_DPAD_LEFT) ? P_LEFT : 0;
++    out |= b(SDL_CONTROLLER_BUTTON_DPAD_RIGHT) ? P_RIGHT : 0;
++    out |= b(SDL_CONTROLLER_BUTTON_BACK) ? P_TOUCHPAD : 0;
++    out |= b(SDL_CONTROLLER_BUTTON_LEFTSTICK) ? P_L3 : 0;
++    out |= b(SDL_CONTROLLER_BUTTON_RIGHTSTICK) ? P_R3 : 0;
++    lx = SDL_GameControllerGetAxis(c, SDL_CONTROLLER_AXIS_LEFTX) / 32767.f;
++    ly = SDL_GameControllerGetAxis(c, SDL_CONTROLLER_AXIS_LEFTY) / 32767.f;
++    return out;
++}
++
++// The pad for menus: new presses, held directions with repeat (Resonance's MenuInput). Buttons
++// already down when the menu (re)appears aren't new presses in it.
++struct MenuInput {
++    int dx = 0, dy = 0;
++    bool cross = false, circle = false, triangle = false, square = false, l1 = false, r1 = false;
++    bool touchpad = false;
++
++    // Also clears the one-shot presses: the last read before the menu closed (the Cross that hit
++    // Resume) would otherwise still be set on the first draw after reopening and close it at once.
++    void reset(uint32_t buttons) {
++        prev = buttons;
++        held = -1;
++        dx = dy = 0;
++        cross = circle = triangle = square = l1 = r1 = touchpad = false;
++    }
++
++    void read(uint32_t buttons, float lx, float ly, float t) {
++        const uint32_t pressed = buttons & ~prev;
++        prev = buttons;
++        cross = pressed & P_CROSS;
++        circle = pressed & P_CIRCLE;
++        triangle = pressed & P_TRIANGLE;
++        square = pressed & P_SQUARE;
++        l1 = pressed & P_L1;
++        r1 = pressed & P_R1;
++        touchpad = pressed & P_TOUCHPAD;
++        int dir = 0;
++        if ((buttons & P_LEFT) || lx < -.55f) {
++            dir = 1;
++        } else if ((buttons & P_RIGHT) || lx > .55f) {
++            dir = 2;
++        } else if ((buttons & P_UP) || ly < -.55f) {
++            dir = 3;
++        } else if ((buttons & P_DOWN) || ly > .55f) {
++            dir = 4;
++        }
++        dx = dy = 0;
++        if (held == -1) {
++            // wait for a direction held across the change to be let go
++            if (dir == 0) {
++                held = 0;
++            }
++            return;
++        }
++        bool fire = false;
++        if (dir != held) {
++            held = dir;
++            fire = dir != 0;
++            repeatAt = t + .38f;
++        } else if (dir != 0 && t >= repeatAt) {
++            fire = true;
++            repeatAt = t + .085f;
++        }
++        if (fire) {
++            dx = dir == 1 ? -1 : dir == 2 ? 1 : 0;
++            dy = dir == 3 ? -1 : dir == 4 ? 1 : 0;
++        }
++    }
++
++  private:
++    uint32_t prev = 0;
++    int held = -1;
++    float repeatAt = 0;
++};
++
++// ------------------------------------------------------------------------------------------------
++// G-Diffuser hooks
++// ------------------------------------------------------------------------------------------------
++
++std::shared_ptr<Ship::Window> window() {
++    auto ctx = Ship::Context::GetInstance();
++    return ctx != nullptr ? ctx->GetWindow() : nullptr;
++}
++
++Fast::GfxRenderingAPIVulkan* vulkan() {
++    auto fw = std::dynamic_pointer_cast<Fast::Fast3dWindow>(window());
++    if (fw == nullptr) {
++        return nullptr;
++    }
++    auto interpreter = fw->GetInterpreterWeak().lock();
++    return interpreter != nullptr ? dynamic_cast<Fast::GfxRenderingAPIVulkan*>(interpreter->GetCurrentRenderingAPI())
++                                  : nullptr;
++}
++
++std::shared_ptr<Ship::GuiWindow> fpsWindow() {
++    auto w = window();
++    return w != nullptr ? w->GetGui()->GetGuiWindow("FPS Counter") : nullptr;
++}
++
++bool fpsShown() {
++    auto fps = fpsWindow();
++    return fps != nullptr && fps->IsVisible();
++}
++
++void toggleFps() {
++    if (auto fps = fpsWindow()) {
++        fps->ToggleVisibility();
++    }
++}
++
++bool enhancementsVisible() {
++    auto w = window();
++    return w != nullptr && w->GetGui()->GetMenu() != nullptr && w->GetGui()->GetMenu()->IsVisible();
++}
++
++void setEnhancementsVisible(bool on) {
++    auto w = window();
++    if (w == nullptr || w->GetGui()->GetMenu() == nullptr || w->GetGui()->GetMenu()->IsVisible() == on) {
++        return;
++    }
++    if (on) {
++        // the pad drives it (port/gdx_imgui_nav.cpp)
++        CVarSetInteger("gControlNav", 1);
++    }
++    w->GetGui()->GetMenu()->ToggleVisibility();
++}
++
++// ------------------------------------------------------------------------------------------------
++// Settings and Enhancements: the G-Diffuser menu's own registry (port/gdx_menu_registry.cpp), shown
++// as pad-driven pages -- L1/R1 between pages, Left/Right change the value, Cross toggles or runs.
++// The full-screen menu itself never opens on the console.
++// ------------------------------------------------------------------------------------------------
++
++std::shared_ptr<GdxMenu> gdxMenu() {
++    auto w = window();
++    return w != nullptr ? std::dynamic_pointer_cast<GdxMenu>(w->GetGui()->GetMenu()) : nullptr;
++}
++
++// Pages that only make sense with a mouse and keyboard, or a PC around them.
++bool pcOnlyPage(const std::string& sidebar) {
++    return sidebar == "Mouse" || sidebar == "Controls";
++}
++
++bool usableWidget(const GdxUI::WidgetInfo& w) {
++    switch (w.type) {
++        case GdxUI::WIDGET_CHECKBOX:
++        case GdxUI::WIDGET_CVAR_CHECKBOX:
++        case GdxUI::WIDGET_COMBOBOX:
++        case GdxUI::WIDGET_CVAR_COMBOBOX:
++        case GdxUI::WIDGET_SLIDER_INT:
++        case GdxUI::WIDGET_CVAR_SLIDER_INT:
++        case GdxUI::WIDGET_SLIDER_FLOAT:
++        case GdxUI::WIDGET_CVAR_SLIDER_FLOAT:
++        case GdxUI::WIDGET_CVAR_RADIO_BUTTON:
++        case GdxUI::WIDGET_BUTTON:
++            return true;
++        default:
++            return false;
++    }
++}
++
++const std::vector<GdxMenu::QuickPage>& pages(int section) {
++    static std::vector<GdxMenu::QuickPage> sPages[2];
++    static bool sBuilt = false;
++    if (!sBuilt) {
++        if (auto menu = gdxMenu()) {
++            sBuilt = true;
++            for (int i = 0; i < 2; i++) {
++                for (auto& page : menu->QuickMenuPages({ i == 0 ? "Settings" : "Enhancements" })) {
++                    if (pcOnlyPage(page.sidebar)) {
++                        continue;
++                    }
++                    const bool any = std::any_of(page.widgets.begin(), page.widgets.end(),
++                                                 [](const GdxUI::WidgetInfo* w) { return usableWidget(*w); });
++                    if (any) {
++                        sPages[i].push_back(std::move(page));
++                    }
++                }
++            }
++        }
++    }
++    return sPages[section];
++}
++
++// One row of the current page: a control, or a heading (SEPARATOR_TEXT) over the controls below it.
++struct Item {
++    GdxUI::WidgetInfo* w;
++    bool heading;
++    bool disabled;
++};
++
++// The page as it stands this frame: hidden controls dropped, headings with nothing under them dropped.
++std::vector<Item> pageItems(const GdxMenu::QuickPage& page) {
++    auto menu = gdxMenu();
++    std::vector<Item> items;
++    if (menu == nullptr) {
++        return items;
++    }
++    for (GdxUI::WidgetInfo* w : page.widgets) {
++        if (w->type == GdxUI::WIDGET_SEPARATOR_TEXT) {
++            if (!items.empty() && items.back().heading) {
++                items.pop_back();
++            }
++            items.push_back({ w, true, false });
++            continue;
++        }
++        if (!usableWidget(*w) || menu->QuickMenuHidden(*w)) {
++            continue;
++        }
++        items.push_back({ w, false, menu->QuickMenuDisabled(*w) });
++    }
++    if (!items.empty() && items.back().heading) {
++        items.pop_back();
++    }
++    return items;
++}
++
++template <typename T> T* ptr(const GdxUI::WidgetInfo& w) {
++    T* const* p = std::get_if<T*>(&w.valuePointer);
++    return p != nullptr ? *p : nullptr;
++}
++
++template <typename T> const T& opts(const GdxUI::WidgetInfo& w) {
++    static const T kDefaults{};
++    return w.options != nullptr ? *std::static_pointer_cast<T>(w.options) : kDefaults;
++}
++
++std::string formatted(const char* format, double v, bool integer) {
++    char buf[64];
++    if (format == nullptr || *format == 0) {
++        format = integer ? "%d" : "%.2f";
++    }
++    if (integer) {
++        snprintf(buf, sizeof(buf), format, (int)v);
++    } else {
++        snprintf(buf, sizeof(buf), format, v);
++    }
++    return buf;
++}
++
++int32_t comboValue(const GdxUI::WidgetInfo& w) {
++    if (w.type == GdxUI::WIDGET_COMBOBOX) {
++        int32_t* v = ptr<int32_t>(w);
++        return v != nullptr ? *v : 0;
++    }
++    return CVarGetInteger(w.cVar, (int32_t)opts<UIWidgets::ComboboxOptions>(w).defaultIndex);
++}
++
++// The rows a combobox offers, in order: its comboItems, else its comboMap's keys ascending.
++std::vector<std::pair<int32_t, const char*>> comboRows(const GdxUI::WidgetInfo& w) {
++    std::vector<std::pair<int32_t, const char*>> rows;
++    if (!w.comboItems.empty()) {
++        for (size_t i = 0; i < w.comboItems.size(); i++) {
++            rows.push_back({ (int32_t)i, w.comboItems[i] });
++        }
++    } else {
++        for (const auto& kv : opts<UIWidgets::ComboboxOptions>(w).comboMap) {
++            rows.push_back(kv);
++        }
++        std::sort(rows.begin(), rows.end());
++    }
++    return rows;
++}
++
++std::string widgetValue(const GdxUI::WidgetInfo& w) {
++    switch (w.type) {
++        case GdxUI::WIDGET_CVAR_CHECKBOX:
++            return CVarGetInteger(w.cVar, opts<UIWidgets::CheckboxOptions>(w).defaultValue) ? "On" : "Off";
++        case GdxUI::WIDGET_CHECKBOX: {
++            bool* v = ptr<bool>(w);
++            return v != nullptr && *v ? "On" : "Off";
++        }
++        case GdxUI::WIDGET_COMBOBOX:
++        case GdxUI::WIDGET_CVAR_COMBOBOX: {
++            const int32_t v = comboValue(w);
++            for (const auto& row : comboRows(w)) {
++                if (row.first == v) {
++                    return row.second;
++                }
++            }
++            return std::to_string(v);
++        }
++        case GdxUI::WIDGET_CVAR_SLIDER_INT: {
++            const auto& o = opts<UIWidgets::IntSliderOptions>(w);
++            return formatted(o.format, CVarGetInteger(w.cVar, o.defaultValue), true);
++        }
++        case GdxUI::WIDGET_SLIDER_INT: {
++            int32_t* v = ptr<int32_t>(w);
++            return v != nullptr ? formatted(opts<UIWidgets::IntSliderOptions>(w).format, *v, true) : "";
++        }
++        case GdxUI::WIDGET_CVAR_SLIDER_FLOAT:
++        case GdxUI::WIDGET_SLIDER_FLOAT: {
++            const auto& o = opts<UIWidgets::FloatSliderOptions>(w);
++            float v = o.defaultValue;
++            if (w.type == GdxUI::WIDGET_CVAR_SLIDER_FLOAT) {
++                v = CVarGetFloat(w.cVar, o.defaultValue);
++            } else if (float* p = ptr<float>(w)) {
++                v = *p;
++            }
++            return formatted(o.format, o.isPercentage ? v * 100.f : v, false);
++        }
++        case GdxUI::WIDGET_CVAR_RADIO_BUTTON:
++            return CVarGetInteger(w.cVar, 0) == w.radioValue ? ICON_FA_CHECK : "";
++        case GdxUI::WIDGET_BUTTON:
++            return ICON_FA_ANGLE_RIGHT;
++        default:
++            return "";
++    }
++}
++
++// dir -1/+1 from Left/Right, 0 from Cross. True when the value changed (or a button ran).
++bool widgetChange(GdxUI::WidgetInfo& w, int dir) {
++    bool changed = false;
++    switch (w.type) {
++        case GdxUI::WIDGET_CVAR_CHECKBOX:
++            CVarSetInteger(w.cVar, !CVarGetInteger(w.cVar, opts<UIWidgets::CheckboxOptions>(w).defaultValue));
++            changed = true;
++            break;
++        case GdxUI::WIDGET_CHECKBOX:
++            if (bool* v = ptr<bool>(w)) {
++                *v = !*v;
++                changed = true;
++            }
++            break;
++        case GdxUI::WIDGET_COMBOBOX:
++        case GdxUI::WIDGET_CVAR_COMBOBOX: {
++            const auto rows = comboRows(w);
++            if (rows.empty()) {
++                break;
++            }
++            const int32_t v = comboValue(w);
++            int at = 0;
++            for (int i = 0; i < (int)rows.size(); i++) {
++                if (rows[i].first == v) {
++                    at = i;
++                }
++            }
++            const int n = (int)rows.size();
++            const int32_t next = rows[((at + (dir == 0 ? 1 : dir)) % n + n) % n].first;
++            if (w.type == GdxUI::WIDGET_CVAR_COMBOBOX) {
++                CVarSetInteger(w.cVar, next);
++            } else if (int32_t* v = ptr<int32_t>(w)) {
++                *v = next;
++            }
++            changed = true;
++            break;
++        }
++        case GdxUI::WIDGET_CVAR_SLIDER_INT:
++        case GdxUI::WIDGET_SLIDER_INT: {
++            if (dir == 0) {
++                break;
++            }
++            const auto& o = opts<UIWidgets::IntSliderOptions>(w);
++            int32_t* p = w.type == GdxUI::WIDGET_SLIDER_INT ? ptr<int32_t>(w) : nullptr;
++            const int32_t v = p != nullptr ? *p : CVarGetInteger(w.cVar, o.defaultValue);
++            const int32_t next = std::clamp(v + dir * std::max(o.step, 1), o.min, o.max);
++            if (next != v) {
++                if (p != nullptr) {
++                    *p = next;
++                } else if (w.type == GdxUI::WIDGET_CVAR_SLIDER_INT) {
++                    CVarSetInteger(w.cVar, next);
++                }
++                changed = p != nullptr || w.type == GdxUI::WIDGET_CVAR_SLIDER_INT;
++            }
++            break;
++        }
++        case GdxUI::WIDGET_CVAR_SLIDER_FLOAT:
++        case GdxUI::WIDGET_SLIDER_FLOAT: {
++            if (dir == 0) {
++                break;
++            }
++            const auto& o = opts<UIWidgets::FloatSliderOptions>(w);
++            float* p = w.type == GdxUI::WIDGET_SLIDER_FLOAT ? ptr<float>(w) : nullptr;
++            const float v = p != nullptr ? *p : CVarGetFloat(w.cVar, o.defaultValue);
++            const float step = o.step > 0 ? o.step : .01f;
++            // snap to the step so repeated nudges don't drift (UIWidgets does the same)
++            const float next = std::clamp(std::round((v + dir * step) / step) * step, o.min, o.max);
++            if (next != v) {
++                if (p != nullptr) {
++                    *p = next;
++                    changed = true;
++                } else if (w.type == GdxUI::WIDGET_CVAR_SLIDER_FLOAT) {
++                    CVarSetFloat(w.cVar, next);
++                    changed = true;
++                }
++            }
++            break;
++        }
++        case GdxUI::WIDGET_CVAR_RADIO_BUTTON:
++            if (CVarGetInteger(w.cVar, 0) != w.radioValue) {
++                CVarSetInteger(w.cVar, w.radioValue);
++                changed = true;
++            }
++            break;
++        case GdxUI::WIDGET_BUTTON:
++            changed = dir == 0;
++            break;
++        default:
++            break;
++    }
++    if (changed && w.callback != nullptr) {
++        w.callback(w);
++    }
++    return changed;
++}
++
++// ------------------------------------------------------------------------------------------------
++// The menu
++// ------------------------------------------------------------------------------------------------
++
++enum Row { RESUME, RESET, VOLUME, FPS, WIDESCREEN, SETTINGS, ENHANCEMENTS, CLOSE, ROWS };
++
++enum class State { Closed, Open, Leaving };
++State gState = State::Closed;
++MenuInput gIn;
++int gSel;
++float gPos, gVel;
++float gOpenedAt;
++bool gChanged;
++bool gInSettings;
++int gSection; // 0 Settings, 1 Enhancements
++int gGroup, gOpt;
++float gOptPos, gOptVel, gScroll;
++ImTextureID gFrozen;
++uint32_t gComboPrev;
++bool gQuitRequested;
++// Debounce: the touchpad click (and L3+R3) chatters, and each bounce toggled the menu, which then
++// flashed open and shut. A press counts only after the buttons were let go for a while.
++float gComboReleasedAt = -10.f;
++bool gComboHeld;
++
++void open(float t, uint32_t buttons) {
++    gState = State::Open;
++    gSel = RESUME;
++    gPos = 0;
++    gVel = 0;
++    gOpenedAt = t;
++    gChanged = false;
++    gInSettings = false;
++    gIn.reset(buttons);
++    if (auto vk = vulkan()) {
++        gFrozen = vk->CaptureLastFrame();
++    }
++    soundStart();
++    playSound(Sound::Category);
++    gdx_port_logf("[quickmenu] opened\n");
++}
++
++void leave() {
++    if (gChanged) {
++        CVarSave();
++    }
++    gState = State::Leaving;
++}
++
++} // namespace
++
++bool GdxPs4QuickMenuUpdate() {
++    float lx, ly;
++    const uint32_t buttons = padButtons(lx, ly);
++    const float t = nowSeconds();
++    gComboPrev = buttons;
++    // the touchpad, or L3+R3 together; a new press only after both were let go for 0.3 s
++    const bool comboDown = (buttons & P_TOUCHPAD) || (buttons & (P_L3 | P_R3)) == (P_L3 | P_R3);
++    bool combo = false;
++    if (comboDown && !gComboHeld) {
++        combo = t - gComboReleasedAt >= .3f;
++        gComboHeld = true;
++    } else if (!comboDown && gComboHeld) {
++        gComboHeld = false;
++        gComboReleasedAt = t;
++    }
++
++    switch (gState) {
++        case State::Closed:
++            if (combo) {
++                if (enhancementsVisible()) {
++                    // the full G-Diffuser menu is up: the touchpad closes it
++                    setEnhancementsVisible(false);
++                    playSound(Sound::Back);
++                    return false;
++                }
++                open(t, buttons);
++                return true;
++            }
++            return false;
++        case State::Open:
++            gIn.read(buttons, lx, ly, t);
++            // the touchpad closes it too, but not in its first half second (the opening press)
++            if (combo && t - gOpenedAt >= .5f) {
++                playSound(Sound::Back);
++                leave();
++            }
++            return true;
++        case State::Leaving:
++            // the game resumes once Cross/Circle are let go, so the press isn't seen by it too
++            if ((buttons & (P_CROSS | P_CIRCLE | P_TOUCHPAD | P_L3 | P_R3)) != 0) {
++                return true;
++            }
++            gState = State::Closed;
++            gdx_port_logf("[quickmenu] closed\n");
++            if (gQuitRequested) {
++                soundStop();
++                if (auto w = window()) {
++                    w->Close();
++                }
++            }
++            return false;
++    }
++    return false;
++}
++
++void GdxPs4QuickMenuDraw() {
++    Frame f = menuFrame();
++    ImDrawList* dl = f.dl;
++    // the paused game
++    if (gFrozen != nullptr) {
++        dl->AddImage(gFrozen, ImVec2(0, 0), ImVec2(f.w, f.h));
++    } else {
++        dl->AddRectFilled(ImVec2(0, 0), ImVec2(f.w, f.h), IM_COL32(0, 0, 0, 255));
++    }
++    const float in = gState == State::Open ? easeOut((f.t - gOpenedAt) / .25f) : 1.f;
++
++    // ---- input ----
++    if (gState == State::Open) {
++        if (gInSettings) {
++            if (auto menu = gdxMenu()) {
++                menu->QuickMenuEvaluate();
++            }
++            const auto& ps = pages(gSection);
++            const std::vector<Item> items = ps.empty() ? std::vector<Item>{} : pageItems(ps[gGroup]);
++            // the selection skips headings; the first control when the page changed under it
++            const auto selectable = [&](int i) { return i >= 0 && i < (int)items.size() && !items[i].heading; };
++            if (!selectable(gOpt)) {
++                gOpt = 0;
++                while (gOpt < (int)items.size() && !selectable(gOpt)) {
++                    gOpt++;
++                }
++            }
++            if (gIn.circle) {
++                gInSettings = false;
++                playSound(Sound::Back);
++            } else if ((gIn.l1 || gIn.r1) && ps.size() > 1) {
++                gGroup = (gGroup + (gIn.r1 ? 1 : -1) + (int)ps.size()) % (int)ps.size();
++                gOpt = -1;
++                gOptPos = 0;
++                gScroll = 0;
++                playSound(Sound::Category);
++            } else if (gIn.dy != 0 && !items.empty()) {
++                int next = gOpt;
++                for (int k = 0; k < (int)items.size(); k++) {
++                    next = (next + gIn.dy + (int)items.size()) % (int)items.size();
++                    if (selectable(next)) {
++                        break;
++                    }
++                }
++                if (selectable(next) && next != gOpt) {
++                    gOpt = next;
++                    playSound(Sound::Move);
++                }
++            } else if ((gIn.dx != 0 || gIn.cross) && selectable(gOpt)) {
++                if (items[gOpt].disabled) {
++                    playSound(Sound::Back);
++                } else if (widgetChange(*items[gOpt].w, gIn.dx)) {
++                    gChanged = true;
++                    playSound(items[gOpt].w->type == GdxUI::WIDGET_BUTTON ? Sound::Confirm : Sound::Move);
++                }
++            }
++        } else {
++            if (gIn.dy != 0) {
++                gSel = (gSel + gIn.dy + ROWS) % ROWS;
++                playSound(Sound::Move);
++            }
++            if (gIn.dx != 0) {
++                switch (gSel) {
++                    case VOLUME:
++                        CVarSetInteger("gEnhancements.Audio.MasterVolume",
++                                       std::clamp(CVarGetInteger("gEnhancements.Audio.MasterVolume", 100) + gIn.dx * 10, 0,
++                                                  100));
++                        gChanged = true;
++                        playSound(Sound::Move);
++                        break;
++                    case FPS:
++                        toggleFps();
++                        playSound(Sound::Move);
++                        break;
++                    case WIDESCREEN:
++                        CVarSetInteger("gEnhancements.Graphics.Widescreen",
++                                       !CVarGetInteger("gEnhancements.Graphics.Widescreen", 1));
++                        gChanged = true;
++                        playSound(Sound::Move);
++                        break;
++                }
++            }
++            if (gIn.cross) {
++                switch (gSel) {
++                    case RESUME:
++                        playSound(Sound::Back);
++                        leave();
++                        break;
++                    case RESET:
++                        playSound(Sound::Confirm);
++                        gdx_game_request_reset();
++                        leave();
++                        break;
++                    case VOLUME:
++                        break;
++                    case FPS:
++                        toggleFps();
++                        playSound(Sound::Move);
++                        break;
++                    case WIDESCREEN:
++                        CVarSetInteger("gEnhancements.Graphics.Widescreen",
++                                       !CVarGetInteger("gEnhancements.Graphics.Widescreen", 1));
++                        gChanged = true;
++                        playSound(Sound::Move);
++                        break;
++                    case SETTINGS:
++                    case ENHANCEMENTS:
++                        if (pages(gSel == SETTINGS ? 0 : 1).empty()) {
++                            playSound(Sound::Back);
++                            break;
++                        }
++                        playSound(Sound::Confirm);
++                        gInSettings = true;
++                        gSection = gSel == SETTINGS ? 0 : 1;
++                        gGroup = 0;
++                        gOpt = -1;
++                        gOptPos = 0;
++                        gOptVel = 0;
++                        gScroll = 0;
++                        break;
++                    case CLOSE:
++                        playSound(Sound::Back);
++                        gQuitRequested = true;
++                        leave();
++                        break;
++                }
++            }
++            if (gIn.circle) {
++                playSound(Sound::Back);
++                leave();
++            }
++        }
++    }
++
++    // ---- the paused game behind a side panel ----
++    const float panelW = f.w * .4f;
++    const float slide = (1 - in) * -panelW * .3f;
++    const ImU32 dark = IM_COL32(4, 8, 18, (int)(235 * in)), mid = IM_COL32(4, 8, 18, (int)(150 * in)),
++                clear = IM_COL32(4, 8, 18, 0);
++    dl->AddRectFilled(ImVec2(0, 0), ImVec2(f.w, f.h), IM_COL32(0, 0, 0, (int)(70 * in)));
++    dl->AddRectFilledMultiColor(ImVec2(0, 0), ImVec2(panelW, f.h), dark, mid, mid, dark);
++    dl->AddRectFilledMultiColor(ImVec2(panelW, 0), ImVec2(panelW + f.w * .15f, f.h), mid, clear, clear, mid);
++    const Color tone = xmbTone();
++    dl->AddRectFilled(ImVec2(panelW - 2 + slide, 0), ImVec2(panelW + slide, f.h), tone.u32(.6f * in));
++
++    // logo, game, PAUSED
++    const float x = f.w * .05f + slide;
++    const float coverH = f.h * .1f;
++    const float headY = f.h * .135f;
++    xmbText(dl, bodyFont(), f.h * .034f, ImVec2(x, f.h * .055f), in * .95f, "G-DIFFUSER");
++    dl->AddRectFilledMultiColor(ImVec2(x, headY), ImVec2(x + coverH, headY + coverH), tone.u32(in),
++                                mix(tone, { 0, 0, 0 }, .5f).u32(in), mix(tone, { 0, 0, 0 }, .7f).u32(in),
++                                mix(tone, { 1, 1, 1 }, .2f).u32(in));
++    xmbText(dl, bodyFont(), coverH * .55f, ImVec2(x + coverH * .5f, headY + coverH * .2f), in, ICON_FA_FLAG_CHECKERED,
++            .5f);
++    const float tx = x + coverH + f.w * .015f;
++    const float pill = f.h * .02f;
++    const std::string paused = "PAUSED";
++    const float pw = textWidth(bodyFont(), pill, paused) + pill * 1.4f;
++    const float pulse = .75f + .25f * std::sin(f.t * 3.f);
++    dl->AddRectFilled(ImVec2(tx, headY + f.h * .005f), ImVec2(tx + pw, headY + f.h * .005f + pill * 1.6f),
++                      tone.u32(.9f * in * pulse), pill * .8f);
++    xmbText(dl, bodyFont(), pill, ImVec2(tx + pill * .7f, headY + f.h * .005f + pill * .28f), in, paused);
++    xmbText(dl, bodyFont(), f.h * .032f, ImVec2(tx, headY + f.h * .005f + pill * 2.3f), in, "F-Zero X", 0,
++            panelW - (tx - slide) - f.w * .02f);
++
++    // the rows
++    spring(gPos, gVel, (float)gSel, 170.f, 26.f, f.dt);
++    struct RowView {
++        const char* icon;
++        std::string label, value;
++        bool arrows;
++    };
++    const int volume = CVarGetInteger("gEnhancements.Audio.MasterVolume", 100);
++    const RowView rows[ROWS] = {
++        { ICON_FA_PLAY, "Resume", "", false },
++        { ICON_FA_REFRESH, "Reset Game", "", false },
++        { ICON_FA_VOLUME_UP, "Volume Level", std::to_string(volume) + "%", true },
++        { ICON_FA_TACHOMETER, "Show FPS Counter", fpsShown() ? "On" : "Off", true },
++        { ICON_FA_TELEVISION, "Widescreen", CVarGetInteger("gEnhancements.Graphics.Widescreen", 1) ? "On" : "Off", true },
++        { ICON_FA_COG, "Settings", "", false },
++        { ICON_FA_SLIDERS, "Enhancements", "", false },
++        { ICON_FA_POWER_OFF, "Close Game", "", false },
++    };
++    const float rowH = f.h * .068f, top = f.h * .27f;
++    const float rx0 = x - f.w * .01f, rx1 = panelW - f.w * .025f + slide;
++    const float listAlpha = gInSettings ? .45f : 1.f;
++    // the highlight glides between rows
++    const float hy = top + gPos * rowH;
++    dl->AddRectFilledMultiColor(ImVec2(rx0, hy), ImVec2(rx1, hy + rowH), tone.u32(.55f * in * listAlpha),
++                                tone.u32(.12f * in * listAlpha), tone.u32(.12f * in * listAlpha),
++                                tone.u32(.55f * in * listAlpha));
++    dl->AddRectFilled(ImVec2(rx0, hy), ImVec2(rx0 + 4, hy + rowH), IM_COL32(255, 255, 255, (int)(230 * in * listAlpha)));
++    const float ts = f.h * .029f;
++    for (int i = 0; i < ROWS; i++) {
++        const RowView& r = rows[i];
++        const float y = top + i * rowH;
++        const float a = in * listAlpha * (i == gSel ? 1.f : .82f);
++        const float ty = y + (rowH - ts) * .5f;
++        xmbText(dl, bodyFont(), ts * .95f, ImVec2(x + ts * .7f, ty), a, r.icon, .5f);
++        xmbText(dl, bodyFont(), ts, ImVec2(x + ts * 2.f, ty), a, r.label);
++        if (!r.value.empty()) {
++            std::string v = r.value;
++            if (r.arrows && i == gSel && !gInSettings) {
++                v = std::string(ICON_FA_CARET_LEFT "  ") + v + "  " ICON_FA_CARET_RIGHT;
++            }
++            xmbText(dl, bodyFont(), ts * .9f, ImVec2(rx1 - f.w * .01f, ty), a, v, 1.f);
++        }
++    }
++
++    // ---- settings, beside the panel ----
++    if (gInSettings) {
++        const auto& ps = pages(gSection);
++        const std::vector<Item> items = ps.empty() ? std::vector<Item>{} : pageItems(ps[gGroup]);
++        const float sx0 = panelW + f.w * .05f, sx1 = f.w * .95f;
++        // the page: section, name, and where it sits among the others
++        const std::string section = gSection == 0 ? "SETTINGS" : "ENHANCEMENTS";
++        xmbText(dl, bodyFont(), ts * .7f, ImVec2(sx0, f.h * .155f), in * .7f, section);
++        const std::string name = ps.empty() ? "" : ps[gGroup].sidebar;
++        const float nameW = textWidth(bodyFont(), ts * 1.1f, name) + ts * 1.6f;
++        dl->AddRectFilled(ImVec2(sx0, f.h * .19f), ImVec2(sx0 + nameW, f.h * .19f + ts * 1.9f), tone.u32(.75f * in),
++                          ts * .95f);
++        xmbText(dl, bodyFont(), ts * 1.1f, ImVec2(sx0 + ts * .8f, f.h * .19f + ts * .35f), in, name);
++        if (ps.size() > 1) {
++            const std::string where = std::to_string(gGroup + 1) + " / " + std::to_string(ps.size());
++            xmbText(dl, bodyFont(), ts * .8f, ImVec2(sx1, f.h * .19f + ts * .5f), in * .7f, where, 1.f);
++        }
++
++        // the rows, scrolled to keep the selection in view
++        const float oRowH = f.h * .056f;
++        const float sTop = f.h * .27f, sBottom = f.h * .80f;
++        const int visible = std::max(1, (int)((sBottom - sTop) / oRowH));
++        const int sel = std::max(gOpt, 0);
++        float want = gScroll;
++        if (sel < want + 1) {
++            want = (float)std::max(0, sel - 1);
++        } else if (sel > want + visible - 2) {
++            want = (float)std::min(sel - visible + 2, std::max(0, (int)items.size() - visible));
++        }
++        gScroll = want;
++        spring(gOptPos, gOptVel, (float)sel, 170.f, 26.f, f.dt);
++        dl->AddRectFilled(ImVec2(sx0, sTop - f.h * .01f),
++                          ImVec2(sx1, sTop + std::min((int)items.size(), visible) * oRowH + f.h * .01f),
++                          IM_COL32(4, 8, 18, (int)(170 * in)), 8.f);
++        dl->PushClipRect(ImVec2(sx0, sTop - f.h * .01f), ImVec2(sx1, sTop + visible * oRowH + f.h * .01f), true);
++        if (!items.empty()) {
++            const float shy = sTop + (gOptPos - gScroll) * oRowH;
++            dl->AddRectFilledMultiColor(ImVec2(sx0, shy), ImVec2(sx1, shy + oRowH), tone.u32(.55f * in),
++                                        tone.u32(.12f * in), tone.u32(.12f * in), tone.u32(.55f * in));
++            dl->AddRectFilled(ImVec2(sx0, shy), ImVec2(sx0 + 4, shy + oRowH),
++                              IM_COL32(255, 255, 255, (int)(230 * in)));
++        }
++        const float ots = ts * .92f;
++        const float valueW = (sx1 - sx0) * .36f;
++        for (int i = (int)gScroll; i < (int)items.size() && i < (int)gScroll + visible + 1; i++) {
++            const Item& it = items[i];
++            const float y = sTop + (i - gScroll) * oRowH;
++            const float ty = y + (oRowH - ots) * .5f;
++            if (it.heading) {
++                xmbText(dl, bodyFont(), ots * .8f, ImVec2(sx0 + ots * .8f, ty + ots * .15f), in * .75f,
++                        it.w->name, 0, 0, tone.u32(1.f));
++                continue;
++            }
++            const float a = in * (it.disabled ? .38f : (i == gOpt ? 1.f : .82f));
++            xmbText(dl, bodyFont(), ots, ImVec2(sx0 + ots * 1.3f, ty), a, it.w->name, 0,
++                    (sx1 - sx0) - valueW - ots * 2.f);
++            std::string v = widgetValue(*it.w);
++            const bool arrows = it.w->type != GdxUI::WIDGET_BUTTON && it.w->type != GdxUI::WIDGET_CVAR_RADIO_BUTTON;
++            if (i == gOpt && arrows && !it.disabled) {
++                v = std::string(ICON_FA_CARET_LEFT "  ") + v + "  " ICON_FA_CARET_RIGHT;
++            }
++            xmbText(dl, bodyFont(), ots * .9f, ImVec2(sx1 - ots * .8f, ty), a, v, 1.f, valueW);
++        }
++        dl->PopClipRect();
++        if ((int)items.size() > visible) {
++            // a scroll bar along the right edge
++            const float trackH = visible * oRowH;
++            const float barH = std::max(trackH * visible / items.size(), oRowH * .6f);
++            const float barY = sTop + (trackH - barH) * (gScroll / std::max(1, (int)items.size() - visible));
++            dl->AddRectFilled(ImVec2(sx1 + 6, barY), ImVec2(sx1 + 10, barY + barH),
++                              IM_COL32(255, 255, 255, (int)(140 * in)), 2.f);
++        }
++
++        // what the selected control does: its tooltip, or why it is greyed out
++        if (gOpt >= 0 && gOpt < (int)items.size()) {
++            const GdxUI::WidgetInfo& w = *items[gOpt].w;
++            const char* text = nullptr;
++            if (items[gOpt].disabled) {
++                text = "Not available right now.";
++            } else if (w.options != nullptr && w.options->tooltip != nullptr && *w.options->tooltip) {
++                text = w.options->tooltip;
++            }
++            if (text != nullptr) {
++                std::string flat = text;
++                std::replace(flat.begin(), flat.end(), '\n', ' ');
++                dl->AddText(bodyFont(), ts * .72f, ImVec2(sx0 + 2, sBottom + f.h * .025f),
++                            IM_COL32(220, 228, 240, (int)(210 * in)), flat.c_str(), nullptr, sx1 - sx0);
++            }
++        }
++    }
++
++    xmbClock(f, in);
++    if (gInSettings) {
++        xmbHints(f, { { 'l', "" }, { 'r', "Page" }, { 'x', "Change" }, { 'o', "Back" } }, in);
++    } else {
++        xmbHints(f, { { 'x', "Select" }, { 'o', "Resume" } }, in);
++    }
++}
+diff --git a/port/ps4/quick_menu.h b/port/ps4/quick_menu.h
+new file mode 100644
+index 0000000..c670e90
+--- /dev/null
++++ b/port/ps4/quick_menu.h
+@@ -0,0 +1,10 @@
++// port/ps4/quick_menu.h -- the PS4 quick menu (Resonance's, adapted): touchpad or L3+R3 during the
++// game pauses it behind a PS3-style side panel.
++#pragma once
++
++// Once per host frame, before the game ticks: reads the pad, opens/closes the menu. True while the
++// menu is up (the game is paused: the frame loop presents only the menu over the frozen frame).
++bool GdxPs4QuickMenuUpdate();
++
++// Inside the ImGui frame (between Gui::StartDraw and EndDraw) while GdxPs4QuickMenuUpdate is true.
++void GdxPs4QuickMenuDraw();
